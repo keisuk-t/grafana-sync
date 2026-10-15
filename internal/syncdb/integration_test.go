@@ -106,6 +106,15 @@ func TestDatabaseTransfer(t *testing.T) {
 				t.Fatal("expected orphan rejection")
 			}
 			assertEmpty(t, ctx, db)
+			bad, err = Decode(strings.NewReader(string(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			bad.DataSource.Rows[0][columnIndex(bad.DataSource.Columns, "name")] = str(strings.Repeat("x", 191))
+			if err := db.Import(ctx, bad); err == nil {
+				t.Fatal("expected oversized text rejection, not silent truncation")
+			}
+			assertEmpty(t, ctx, db)
 			assertSentinel(t, ctx, db)
 		})
 	}

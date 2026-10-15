@@ -80,7 +80,7 @@ func TestCells(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, value := range []any{float64(1.5), []byte{0xff}} {
+	for _, value := range []any{float64(1.5), []byte{0xff}, time.Time{}} {
 		if _, err := encodeCell(value); err == nil {
 			t.Fatal("expected unsupported value error")
 		}

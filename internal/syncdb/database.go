@@ -32,6 +32,10 @@ func Open(ctx context.Context, engine, dsn string) (*Database, error) {
 		cfg.Loc = time.UTC
 		cfg.MultiStatements = false
 		cfg.ColumnsWithAlias = false
+		if cfg.Params == nil {
+			cfg.Params = make(map[string]string)
+		}
+		cfg.Params["sql_mode"] = "'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION'"
 		connector, err := mysql.NewConnector(cfg)
 		if err != nil {
 			return nil, errors.New("invalid MySQL connection configuration")
@@ -156,6 +160,9 @@ func encodeCell(value any) (*string, error) {
 			text = "1"
 		}
 	case time.Time:
+		if v.IsZero() {
+			return nil, errors.New("zero database timestamp cannot be transferred losslessly")
+		}
 		text = v.Format(time.RFC3339Nano)
 	default:
 		return nil, errors.New("unsupported database value type")
