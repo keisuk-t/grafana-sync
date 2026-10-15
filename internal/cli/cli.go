@@ -16,7 +16,8 @@ import (
 const usage = `Usage: grafana-sync <export|import> -db <mysql|postgres> -file <snapshot.json> [options]
 
 Transfers org, data_source, all data_keys and matching datasource secrets.
-Import requires all four target tables to be empty. Credentials are read from
+Import defaults to --mode require-empty. Use --mode insert-only to add missing
+primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
 Stop Grafana and back up the target before importing. Dumps contain secrets.
 `
@@ -36,6 +37,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	file := flags.String("file", "", "snapshot path (export refuses to overwrite)")
 	dsnEnv := flags.String("dsn-env", "GRAFANA_SYNC_DSN", "environment variable containing the database DSN")
 	timeout := flags.Duration("timeout", 2*time.Minute, "database operation timeout")
+	modeName := string(syncdb.ImportRequireEmpty)
+	if command == "import" {
+		flags.StringVar(&modeName, "mode", modeName, "import mode: require-empty or insert-only (skip existing primary keys)")
+	}
 	if err := flags.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -44,6 +49,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if flags.NArg() != 0 || *file == "" || (*engine != "mysql" && *engine != "postgres") || *timeout <= 0 {
 		return errors.New("require -db mysql|postgres, -file and a positive -timeout; positional arguments are not supported")
+	}
+	mode := syncdb.ImportMode(modeName)
+	if err := mode.Validate(); err != nil {
+		return err
 	}
 	dsn := os.Getenv(*dsnEnv)
 	if dsn == "" {
@@ -69,9 +78,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	defer db.DB.Close()
 	if command == "import" {
-		if err := db.Import(ctx, snapshot); err != nil {
+		result, err := db.ImportWithMode(ctx, snapshot, mode)
+		if err != nil {
 			return err
 		}
+		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
+		return err
 	} else {
 		snapshot, err = db.Export(ctx)
 		if err != nil {

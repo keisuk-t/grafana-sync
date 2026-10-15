@@ -149,6 +149,16 @@ func TestBinaryCells(t *testing.T) {
 	}
 }
 
+func TestInvalidImportModeDoesNotConnect(t *testing.T) {
+	for _, mode := range []ImportMode{"", "append", "upsert"} {
+		var db Database
+		result, err := db.ImportWithMode(context.Background(), validSnapshot(), mode)
+		if err == nil || result != (ImportResult{}) {
+			t.Fatalf("accepted invalid mode %q", mode)
+		}
+	}
+}
+
 func TestOpenDoesNotExposeDSN(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres", "sqlite"} {
 		_, err := Open(context.Background(), engine, "not-a-dsn/secret-password%")

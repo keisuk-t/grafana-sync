@@ -80,6 +80,9 @@ func TestDatabaseTransfer(t *testing.T) {
 		}
 	}
 	for engine, db := range databases {
+		for source, snapshot := range snapshots {
+			t.Run(source+"_to_"+engine+"_insert_only", func(t *testing.T) { testInsertOnly(t, ctx, db, snapshot) })
+		}
 		t.Run(engine+"_rollback", func(t *testing.T) {
 			clearFixtures(t, ctx, db)
 			data, err := json.Marshal(snapshots[engine])
@@ -141,7 +144,7 @@ func TestDatabaseTransfer(t *testing.T) {
 				defer tx.Rollback()
 				for _, entry := range snapshots[engine].entries() {
 					if entry.name == name {
-						if err := db.insertTable(ctx, tx, name, *entry.table); err != nil {
+						if _, err := db.insertTable(ctx, tx, entry, ImportRequireEmpty); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -178,6 +181,159 @@ func TestDatabaseTransfer(t *testing.T) {
 				t.Fatal("accepted binary metadata for text")
 			}
 			assertEmpty(t, ctx, db)
+		})
+	}
+}
+
+func cloneSnapshot(t *testing.T, s *Snapshot) *Snapshot {
+	t.Helper()
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := Decode(strings.NewReader(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cloned
+}
+
+func insertOnlyTarget(t *testing.T, ctx context.Context, db *Database, source *Snapshot) *Snapshot {
+	t.Helper()
+	clearFixtures(t, ctx, db)
+	s := cloneSnapshot(t, source)
+	for _, entry := range s.entries() {
+		entry.table.Rows = entry.table.Rows[:1]
+	}
+	s.Org.Rows[0][columnIndex(s.Org.Columns, "name")] = str("target-org")
+	s.Org.Rows[0][columnIndex(s.Org.Columns, "version")] = str("99")
+	s.Org.Rows[0][columnIndex(s.Org.Columns, "note")] = str("target-note")
+	s.DataSource.Rows[0][columnIndex(s.DataSource.Columns, "user")] = str("target-user")
+	s.DataSource.Rows[0][columnIndex(s.DataSource.Columns, "secure_json_data")] = str("target-ciphertext")
+	s.DataKeys.Rows[0][columnIndex(s.DataKeys.Columns, "active")] = str("0")
+	s.DataKeys.Rows[0][columnIndex(s.DataKeys.Columns, "encrypted_data")] = str(base64.StdEncoding.EncodeToString([]byte("target-key")))
+	s.Secrets.Rows[0][columnIndex(s.Secrets.Columns, "value")] = str("target-secret")
+	extra := append([]*string(nil), s.Org.Rows[0]...)
+	extra[columnIndex(s.Org.Columns, "id")] = str("9007199254741093")
+	extra[columnIndex(s.Org.Columns, "name")] = str("target-only-org")
+	s.Org.Rows = append(s.Org.Rows, extra)
+	if err := db.Import(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func assertSnapshot(t *testing.T, ctx context.Context, db *Database, want *Snapshot) {
+	t.Helper()
+	got, err := db.Export(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("target rows changed unexpectedly")
+	}
+	assertSentinel(t, ctx, db)
+}
+
+func testInsertOnly(t *testing.T, ctx context.Context, db *Database, source *Snapshot) {
+	t.Run("preserve_existing_and_retry", func(t *testing.T) {
+		existing := insertOnlyTarget(t, ctx, db, source)
+		if err := db.Import(ctx, source); err == nil {
+			t.Fatal("default mode accepted populated tables")
+		}
+		assertSnapshot(t, ctx, db, existing)
+		result, err := db.ImportWithMode(ctx, source, ImportInsertOnly)
+		if err != nil || result != (ImportResult{Inserted: 3, Skipped: 4}) {
+			t.Fatalf("insert-only result: %+v %v", result, err)
+		}
+		want := cloneSnapshot(t, source)
+		for i, entry := range want.entries() {
+			entry.table.Rows[0] = existing.entries()[i].table.Rows[0]
+		}
+		want.Org.Rows = append(want.Org.Rows, existing.Org.Rows[1])
+		assertSnapshot(t, ctx, db, want)
+		result, err = db.ImportWithMode(ctx, source, ImportInsertOnly)
+		if err != nil || result != (ImportResult{Skipped: 7}) {
+			t.Fatalf("retry result: %+v %v", result, err)
+		}
+		assertSnapshot(t, ctx, db, want)
+		assertNextID(t, ctx, db)
+	})
+	for _, name := range []string{"data_source_unique", "secrets_unique", "oversized_text", "target_reference", "schema"} {
+		t.Run(name, func(t *testing.T) {
+			existing := insertOnlyTarget(t, ctx, db, source)
+			incoming := cloneSnapshot(t, source)
+			extra := append([]*string(nil), incoming.Org.Rows[0]...)
+			extra[columnIndex(incoming.Org.Columns, "id")] = str("2")
+			extra[columnIndex(incoming.Org.Columns, "name")] = str("new-org")
+			incoming.Org.Rows = append(incoming.Org.Rows, extra)
+			switch name {
+			case "data_source_unique":
+				extra := append([]*string(nil), incoming.DataSource.Rows[0]...)
+				extra[columnIndex(incoming.DataSource.Columns, "id")] = str("999")
+				incoming.DataSource.Rows = append(incoming.DataSource.Rows, extra)
+			case "secrets_unique":
+				extra := append([]*string(nil), incoming.Secrets.Rows[0]...)
+				extra[columnIndex(incoming.Secrets.Columns, "id")] = str("999")
+				incoming.Secrets.Rows = append(incoming.Secrets.Rows, extra)
+			case "oversized_text":
+				incoming.DataSource.Rows[1][columnIndex(incoming.DataSource.Columns, "user")] = str(strings.Repeat("x", 256))
+			case "target_reference":
+				incoming.DataSource.Rows[0][columnIndex(incoming.DataSource.Columns, "name")] = str("source-renamed")
+				incoming.Secrets.Rows[0][columnIndex(incoming.Secrets.Columns, "namespace")] = str("source-renamed")
+				incoming.Secrets.Rows[0][columnIndex(incoming.Secrets.Columns, "id")] = str("999")
+			case "schema":
+				incoming.Secrets.Columns[columnIndex(incoming.Secrets.Columns, "updated")] = "nonexistent"
+			}
+			if err := incoming.Validate(); err != nil {
+				t.Fatal("fixture must reach the database", err)
+			}
+			result, err := db.ImportWithMode(ctx, incoming, ImportInsertOnly)
+			if err == nil || result != (ImportResult{}) {
+				t.Fatalf("expected atomic failure: %+v %v", result, err)
+			}
+			if strings.Contains(err.Error(), "target-secret") || strings.Contains(err.Error(), "source-renamed") {
+				t.Fatal("error exposed data")
+			}
+			assertSnapshot(t, ctx, db, existing)
+		})
+	}
+	if db.Engine == "mysql" {
+		t.Run("key_collation", func(t *testing.T) {
+			insertOnlyTarget(t, ctx, db, source)
+			incoming := cloneSnapshot(t, source)
+			incoming.DataKeys.Rows[0][columnIndex(incoming.DataKeys.Columns, "name")] = str("KEY-CURRENT")
+			result, err := db.ImportWithMode(ctx, incoming, ImportInsertOnly)
+			if err != nil || result != (ImportResult{Inserted: 3, Skipped: 4}) {
+				t.Fatalf("database collation ignored: %+v %v", result, err)
+			}
+		})
+	}
+	if db.Engine == "postgres" {
+		t.Run("sequence_never_rewinds", func(t *testing.T) {
+			for _, called := range []bool{false, true} {
+				insertOnlyTarget(t, ctx, db, source)
+				if _, err := db.DB.ExecContext(ctx, `SELECT setval('data_source_id_seq',1000,$1)`, called); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.ImportWithMode(ctx, source, ImportInsertOnly); err != nil {
+					t.Fatal(err)
+				}
+				var next int64
+				want := int64(1000)
+				if called {
+					want++
+				}
+				if err := db.DB.QueryRowContext(ctx, `SELECT nextval(pg_get_serial_sequence('data_source','id'))`).Scan(&next); err != nil || next != want {
+					t.Fatalf("sequence rewound: %d %v", next, err)
+				}
+				if _, err := db.ImportWithMode(ctx, source, ImportInsertOnly); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.DB.QueryRowContext(ctx, `SELECT nextval(pg_get_serial_sequence('data_source','id'))`).Scan(&next); err != nil || next != want+1 {
+					t.Fatalf("retry changed sequence: %d %v", next, err)
+				}
+			}
 		})
 	}
 }
@@ -242,7 +398,7 @@ func seedFixtures(t *testing.T, ctx context.Context, db *Database) {
 		{str("444"), str("9007199254740993"), str("missing"), str("datasource"), nil, str(stamp), str(stamp)},
 		{str("555"), str("77"), str("metrics"), str("datasource"), str("unrelated-org"), str(stamp), str(stamp)},
 	}}
-	if err := db.insertTable(ctx, tx, "secrets", unrelated); err != nil {
+	if _, err := db.insertTable(ctx, tx, tableEntry{name: "secrets", key: "id", numeric: true, table: &unrelated}, ImportRequireEmpty); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -279,6 +435,10 @@ func assertSentinel(t *testing.T, ctx context.Context, db *Database) {
 
 func assertNextID(t *testing.T, ctx context.Context, db *Database) {
 	t.Helper()
+	var maxID int64
+	if err := db.DB.QueryRowContext(ctx, "SELECT MAX(id) FROM "+db.quote("org")).Scan(&maxID); err != nil {
+		t.Fatal(err)
+	}
 	stamp := time.Now().UTC()
 	query := "INSERT INTO " + db.quote("org") + " (version,name,created,updated) VALUES (1,?,?,?)"
 	if db.Engine == "postgres" {
@@ -299,7 +459,7 @@ func assertNextID(t *testing.T, ctx context.Context, db *Database) {
 			t.Fatal(err)
 		}
 	}
-	if id <= 9007199254740993 {
+	if id <= maxID {
 		t.Fatal("org sequence did not advance")
 	}
 	for _, entry := range []struct {

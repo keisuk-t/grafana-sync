@@ -71,3 +71,29 @@ func TestImportValidatesBeforeConnecting(t *testing.T) {
 		t.Fatalf("expected validation first: %v", err)
 	}
 }
+
+func TestImportModeFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for _, mode := range []string{"require-empty", "insert-only"} {
+		err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", "missing.json", "--mode", mode}, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || err.Error() != "DSN environment variable is unset or empty" {
+			t.Fatalf("mode %s rejected: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"append", "upsert", ""} {
+		err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", "missing.json", "--mode", mode}, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "import mode must be") {
+			t.Fatalf("mode %s accepted: %v", mode, err)
+		}
+	}
+	if err := Run(context.Background(), []string{"export", "--mode", "insert-only"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("export accepted import-only mode")
+	}
+	var out bytes.Buffer
+	if err := Run(context.Background(), []string{"import", "--help"}, &bytes.Buffer{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "require-empty or insert-only") {
+		t.Fatal("help omits import modes")
+	}
+}
