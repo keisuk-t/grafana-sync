@@ -3,6 +3,7 @@ package syncdb
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strconv"
@@ -69,7 +70,8 @@ func (d *Database) checkStorage(ctx context.Context) error {
 	if d.Engine != "mysql" {
 		return nil
 	}
-	for _, name := range []string{"org", "data_source"} {
+	for _, entry := range (&Snapshot{}).entries() {
+		name := entry.name
 		var engine string
 		if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil {
 			return fmt.Errorf("cannot inspect %s storage engine", name)
@@ -90,14 +92,12 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 		return nil, errors.New("cannot begin export transaction")
 	}
 	defer tx.Rollback()
-	s := &Snapshot{Version: 1}
-	s.Org, err = d.readTable(ctx, tx, "org")
-	if err != nil {
-		return nil, err
-	}
-	s.DataSource, err = d.readTable(ctx, tx, "data_source")
-	if err != nil {
-		return nil, err
+	s := &Snapshot{Version: 2}
+	for _, entry := range s.entries() {
+		*entry.table, err = d.readTable(ctx, tx, entry)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := s.Validate(); err != nil {
 		return nil, err
@@ -108,8 +108,16 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 	return s, nil
 }
 
-func (d *Database) readTable(ctx context.Context, tx *sql.Tx, name string) (Table, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT * FROM "+d.quote(name)+" ORDER BY "+d.quote("id"))
+func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) (Table, error) {
+	name := entry.name
+	query := "SELECT * FROM " + d.quote(name)
+	if name == "secrets" {
+		query += fmt.Sprintf(` WHERE %[1]s = 'datasource' AND EXISTS (
+			SELECT 1 FROM %[2]s
+			WHERE %[2]s.%[3]s = %[4]s.%[3]s AND %[2]s.%[5]s = %[4]s.%[6]s
+		)`, d.quote("type"), d.quote("data_source"), d.quote("org_id"), d.quote("secrets"), d.quote("name"), d.quote("namespace"))
+	}
+	rows, err := tx.QueryContext(ctx, query+" ORDER BY "+d.quote(entry.key))
 	if err != nil {
 		return Table{}, fmt.Errorf("cannot read %s", name)
 	}
@@ -119,6 +127,15 @@ func (d *Database) readTable(ctx context.Context, tx *sql.Tx, name string) (Tabl
 		return Table{}, err
 	}
 	table := Table{Columns: columns, Rows: make([][]*string, 0)}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return Table{}, fmt.Errorf("cannot inspect %s column types", name)
+	}
+	for i, column := range types {
+		if binaryType(column.DatabaseTypeName()) {
+			table.BinaryColumns = append(table.BinaryColumns, columns[i])
+		}
+	}
 	for rows.Next() {
 		values := make([]any, len(columns))
 		ptrs := make([]any, len(columns))
@@ -130,7 +147,11 @@ func (d *Database) readTable(ctx context.Context, tx *sql.Tx, name string) (Tabl
 		}
 		row := make([]*string, len(columns))
 		for i, value := range values {
-			row[i], err = encodeCell(value)
+			if binaryType(types[i].DatabaseTypeName()) {
+				row[i], err = encodeBinary(value)
+			} else {
+				row[i], err = encodeCell(value)
+			}
 			if err != nil {
 				return Table{}, fmt.Errorf("%s.%s: %w", name, columns[i], err)
 			}
@@ -177,6 +198,9 @@ func decodeCell(value *string, kind string) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
+	if binaryType(kind) {
+		return base64.StdEncoding.Strict().DecodeString(*value)
+	}
 	switch strings.ToUpper(kind) {
 	case "INT", "INTEGER", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT", "MEDIUMINT":
 		return strconv.ParseInt(*value, 10, 64)
@@ -192,4 +216,25 @@ func decodeCell(value *string, kind string) (any, error) {
 	default:
 		return nil, errors.New("unsupported target column type")
 	}
+}
+
+func binaryType(kind string) bool {
+	switch strings.ToUpper(kind) {
+	case "BYTEA", "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "BINARY", "VARBINARY":
+		return true
+	default:
+		return false
+	}
+}
+
+func encodeBinary(value any) (*string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	data, ok := value.([]byte)
+	if !ok {
+		return nil, errors.New("unexpected binary database value")
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return &encoded, nil
 }

@@ -22,26 +22,26 @@ func (d *Database) Import(ctx context.Context, s *Snapshot) error {
 	}
 	defer tx.Rollback()
 	if d.Engine == "postgres" {
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE "org", "data_source" IN EXCLUSIVE MODE`); err != nil {
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE "org", "data_keys", "data_source", "secrets" IN EXCLUSIVE MODE`); err != nil {
 			return errors.New("cannot lock target tables")
 		}
 	}
-	for _, name := range []string{"org", "data_source"} {
-		if err := d.requireEmpty(ctx, tx, name); err != nil {
+	for _, entry := range s.entries() {
+		if err := d.requireEmpty(ctx, tx, entry); err != nil {
 			return err
 		}
 	}
-	for _, entry := range []struct {
-		name  string
-		table Table
-	}{{"org", s.Org}, {"data_source", s.DataSource}} {
-		if err := d.insertTable(ctx, tx, entry.name, entry.table); err != nil {
+	for _, entry := range s.entries() {
+		if err := d.insertTable(ctx, tx, entry.name, *entry.table); err != nil {
 			return err
 		}
 	}
 	if d.Engine == "postgres" {
-		for _, name := range []string{"org", "data_source"} {
-			if err := d.restartSequence(ctx, tx, name); err != nil {
+		for _, entry := range s.entries() {
+			if !entry.numeric {
+				continue
+			}
+			if err := d.restartSequence(ctx, tx, entry.name); err != nil {
 				return err
 			}
 		}
@@ -52,8 +52,9 @@ func (d *Database) Import(ctx context.Context, s *Snapshot) error {
 	return nil
 }
 
-func (d *Database) requireEmpty(ctx context.Context, tx *sql.Tx, name string) error {
-	query := "SELECT " + d.quote("id") + " FROM " + d.quote(name)
+func (d *Database) requireEmpty(ctx context.Context, tx *sql.Tx, entry tableEntry) error {
+	name := entry.name
+	query := "SELECT " + d.quote(entry.key) + " FROM " + d.quote(name)
 	if d.Engine == "mysql" {
 		// Lock the empty primary-key range as well as existing rows in InnoDB.
 		query += " FOR UPDATE"
@@ -92,8 +93,12 @@ func (d *Database) insertTable(ctx context.Context, tx *sql.Tx, name string, tab
 	columns := make([]string, len(table.Columns))
 	placeholders := make([]string, len(columns))
 	for i, column := range table.Columns {
-		if _, ok := targetTypes[column]; !ok {
+		kind, ok := targetTypes[column]
+		if !ok {
 			return fmt.Errorf("%s column set differs from the snapshot", name)
+		}
+		if binaryType(kind) != (columnIndex(table.BinaryColumns, column) >= 0) {
+			return fmt.Errorf("%s binary columns differ from the snapshot", name)
 		}
 		columns[i] = d.quote(column)
 		placeholders[i] = "?"

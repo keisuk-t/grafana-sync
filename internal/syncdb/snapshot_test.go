@@ -13,9 +13,11 @@ func str(s string) *string { return &s }
 
 func validSnapshot() *Snapshot {
 	return &Snapshot{
-		Version:    1,
+		Version:    2,
 		Org:        Table{Columns: []string{"id", "name"}, Rows: [][]*string{{str("9007199254740993"), str("日本語")}}},
-		DataSource: Table{Columns: []string{"id", "org_id", "json_data"}, Rows: [][]*string{{str("2"), str("9007199254740993"), nil}}},
+		DataSource: Table{Columns: []string{"id", "org_id", "json_data", "name"}, Rows: [][]*string{{str("2"), str("9007199254740993"), nil, str("metrics")}}},
+		DataKeys:   Table{Columns: []string{"name", "encrypted_data"}, BinaryColumns: []string{"encrypted_data"}, Rows: [][]*string{{str("key-uuid"), str("AP+A")}}},
+		Secrets:    Table{Columns: []string{"id", "org_id", "namespace", "type", "value"}, Rows: [][]*string{{str("3"), str("9007199254740993"), str("metrics"), str("datasource"), str("opaque-ciphertext")}}},
 	}
 }
 
@@ -46,7 +48,8 @@ func TestValidate(t *testing.T) {
 		name   string
 		mutate func(*Snapshot)
 	}{
-		{"version", func(s *Snapshot) { s.Version = 2 }},
+		{"version", func(s *Snapshot) { s.Version = 3 }},
+		{"legacy version", func(s *Snapshot) { s.Version = 1 }},
 		{"missing id", func(s *Snapshot) { s.Org.Columns[0] = "other" }},
 		{"injection", func(s *Snapshot) { s.Org.Columns[1] = `name); DROP TABLE dashboard;--` }},
 		{"duplicate columns", func(s *Snapshot) { s.Org.Columns[1] = "id" }},
@@ -57,6 +60,24 @@ func TestValidate(t *testing.T) {
 		{"duplicate ids", func(s *Snapshot) { s.Org.Rows = append(s.Org.Rows, s.Org.Rows[0]) }},
 		{"missing org", func(s *Snapshot) { s.DataSource.Rows[0][1] = str("22") }},
 		{"null org", func(s *Snapshot) { s.DataSource.Rows[0][1] = nil }},
+		{"null data source name", func(s *Snapshot) { s.DataSource.Rows[0][3] = nil }},
+		{"empty data source name", func(s *Snapshot) { s.DataSource.Rows[0][3] = str("") }},
+		{"missing key table", func(s *Snapshot) { s.DataKeys = Table{} }},
+		{"missing secrets table", func(s *Snapshot) { s.Secrets = Table{} }},
+		{"null key name", func(s *Snapshot) { s.DataKeys.Rows[0][0] = nil }},
+		{"empty key name", func(s *Snapshot) { s.DataKeys.Rows[0][0] = str("") }},
+		{"duplicate keys", func(s *Snapshot) { s.DataKeys.Rows = append(s.DataKeys.Rows, s.DataKeys.Rows[0]) }},
+		{"missing binary metadata", func(s *Snapshot) { s.DataKeys.BinaryColumns = nil }},
+		{"unknown binary column", func(s *Snapshot) { s.DataKeys.BinaryColumns = append(s.DataKeys.BinaryColumns, "other") }},
+		{"duplicate binary column", func(s *Snapshot) { s.DataKeys.BinaryColumns = append(s.DataKeys.BinaryColumns, "encrypted_data") }},
+		{"binary primary key", func(s *Snapshot) { s.DataKeys.BinaryColumns = append(s.DataKeys.BinaryColumns, "name") }},
+		{"invalid base64", func(s *Snapshot) { s.DataKeys.Rows[0][1] = str("not-base64!") }},
+		{"secret org", func(s *Snapshot) { s.Secrets.Rows[0][1] = str("33") }},
+		{"secret namespace", func(s *Snapshot) { s.Secrets.Rows[0][2] = str("not-migrated") }},
+		{"null secret namespace", func(s *Snapshot) { s.Secrets.Rows[0][2] = nil }},
+		{"unrelated secret", func(s *Snapshot) { s.Secrets.Rows[0][3] = str("alerting") }},
+		{"null secret type", func(s *Snapshot) { s.Secrets.Rows[0][3] = nil }},
+		{"missing secret type", func(s *Snapshot) { s.Secrets.Columns[3] = "other" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,7 +88,10 @@ func TestValidate(t *testing.T) {
 			}
 		})
 	}
-	s := &Snapshot{Version: 1, Org: Table{Columns: []string{"id"}, Rows: [][]*string{}}, DataSource: Table{Columns: []string{"id", "org_id"}, Rows: [][]*string{}}}
+	s := validSnapshot()
+	for _, entry := range s.entries() {
+		entry.table.Rows = [][]*string{}
+	}
 	if err := s.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +116,7 @@ func TestCells(t *testing.T) {
 	}{
 		{nil, "TEXT", nil}, {str(""), "VARCHAR", ""}, {str("9007199254740993"), "INT8", int64(9007199254740993)},
 		{str("1"), "BOOL", true}, {str("0"), "BOOLEAN", false}, {str(stamp.Format(time.RFC3339Nano)), "DATETIME", stamp},
+		{str("AP+A"), "BYTEA", []byte{0, 255, 128}}, {str("AP+A"), "BLOB", []byte{0, 255, 128}}, {str(""), "BLOB", []byte{}},
 	}
 	for _, tc := range tests {
 		got, err := decodeCell(tc.value, tc.kind)
@@ -103,6 +128,24 @@ func TestCells(t *testing.T) {
 		if _, err := decodeCell(str(tc.value), tc.kind); err == nil {
 			t.Fatal("accepted invalid cell")
 		}
+	}
+}
+
+func TestBinaryCells(t *testing.T) {
+	for _, value := range []any{nil, []byte{}, []byte{0, 255, 128, 0, 10, 13}, []byte("valid UTF-8 is binary too")} {
+		encoded, err := encodeBinary(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, kind := range []string{"BLOB", "BYTEA", "LONGBLOB", "VARBINARY"} {
+			decoded, err := decodeCell(encoded, kind)
+			if err != nil || !reflect.DeepEqual(decoded, value) {
+				t.Fatalf("binary round trip: %v", err)
+			}
+		}
+	}
+	if _, err := encodeBinary("text"); err == nil {
+		t.Fatal("accepted non-binary value")
 	}
 }
 

@@ -31,7 +31,12 @@ func TestHelpAndValidation(t *testing.T) {
 
 func TestWriteSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
-	s := &syncdb.Snapshot{Version: 1, Org: syncdb.Table{Columns: []string{"id"}, Rows: [][]*string{}}, DataSource: syncdb.Table{Columns: []string{"id", "org_id"}, Rows: [][]*string{}}}
+	s := &syncdb.Snapshot{Version: 2,
+		Org:        syncdb.Table{Columns: []string{"id"}, Rows: [][]*string{}},
+		DataSource: syncdb.Table{Columns: []string{"id", "org_id", "name"}, Rows: [][]*string{}},
+		DataKeys:   syncdb.Table{Columns: []string{"name", "encrypted_data"}, BinaryColumns: []string{"encrypted_data"}, Rows: [][]*string{}},
+		Secrets:    syncdb.Table{Columns: []string{"id", "org_id", "namespace", "type", "value"}, Rows: [][]*string{}},
+	}
 	if err := writeSnapshot(path, s); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +62,7 @@ func TestWriteSnapshot(t *testing.T) {
 
 func TestImportValidatesBeforeConnecting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.json")
-	if err := os.WriteFile(path, []byte(`{"version":2}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")

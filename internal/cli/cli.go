@@ -15,8 +15,9 @@ import (
 
 const usage = `Usage: grafana-sync <export|import> -db <mysql|postgres> -file <snapshot.json> [options]
 
-Only org and data_source are transferred. Import requires both target tables to
-be empty. Connection credentials are read from GRAFANA_SYNC_DSN (or -dsn-env).
+Transfers org, data_source, all data_keys and matching datasource secrets.
+Import requires all four target tables to be empty. Credentials are read from
+GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
 Stop Grafana and back up the target before importing. Dumps contain secrets.
 `
 
@@ -80,7 +81,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows))
+	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows))
 	return err
 }
 
