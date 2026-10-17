@@ -1,0 +1,28 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: local-test-root
+      MYSQL_DATABASE: grafana_sync_test
+      MYSQL_USER: grafana
+      MYSQL_PASSWORD: local-test-password
+    ports:
+      - "127.0.0.1::3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -ugrafana -plocal-test-password grafana_sync_test -e 'SELECT 1' >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: grafana_sync_test
+      POSTGRES_USER: grafana
+      POSTGRES_PASSWORD: local-test-password
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grafana -d grafana_sync_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
