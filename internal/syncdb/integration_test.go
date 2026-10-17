@@ -82,6 +82,7 @@ func TestDatabaseTransfer(t *testing.T) {
 	for engine, db := range databases {
 		for source, snapshot := range snapshots {
 			t.Run(source+"_to_"+engine+"_insert_only", func(t *testing.T) { testInsertOnly(t, ctx, db, snapshot) })
+			t.Run(source+"_to_"+engine+"_sync", func(t *testing.T) { testSync(t, ctx, db, snapshot) })
 		}
 		t.Run(engine+"_rollback", func(t *testing.T) {
 			clearFixtures(t, ctx, db)
@@ -338,6 +339,218 @@ func testInsertOnly(t *testing.T, ctx context.Context, db *Database, source *Sna
 	}
 }
 
+func testSync(t *testing.T, ctx context.Context, db *Database, source *Snapshot) {
+	clearFixtures(t, ctx, db)
+	initial := cloneSnapshot(t, source)
+	orgID := "9007199254740993"
+	protectedOrgID := "9007199254741093"
+	org := append([]*string(nil), initial.Org.Rows[0]...)
+	org[columnIndex(initial.Org.Columns, "id")] = str(protectedOrgID)
+	org[columnIndex(initial.Org.Columns, "name")] = str("protected-org")
+	initial.Org.Rows = append(initial.Org.Rows, org)
+	datasource := append([]*string(nil), initial.DataSource.Rows[0]...)
+	datasource[columnIndex(initial.DataSource.Columns, "id")] = str("500")
+	datasource[columnIndex(initial.DataSource.Columns, "org_id")] = str(protectedOrgID)
+	datasource[columnIndex(initial.DataSource.Columns, "name")] = str("outside")
+	datasource[columnIndex(initial.DataSource.Columns, "uid")] = str("outside-uid")
+	initial.DataSource.Rows = append(initial.DataSource.Rows, datasource)
+	secret := append([]*string(nil), initial.Secrets.Rows[0]...)
+	secret[columnIndex(initial.Secrets.Columns, "id")] = str("600")
+	secret[columnIndex(initial.Secrets.Columns, "org_id")] = str(protectedOrgID)
+	secret[columnIndex(initial.Secrets.Columns, "namespace")] = str("outside")
+	initial.Secrets.Rows = append(initial.Secrets.Rows, secret)
+	if err := db.Import(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ id, namespace, kind string }{{"333", "metrics", "alerting"}, {"444", "orphan", "datasource"}} {
+		query := "INSERT INTO " + db.quote("secrets") + " (id,org_id,namespace," + db.quote("type") + ",value,created,updated) VALUES (" + strings.Join([]string{db.bind(1), db.bind(2), db.bind(3), db.bind(4), db.bind(5), db.bind(6), db.bind(7)}, ",") + ")"
+		if _, err := db.DB.ExecContext(ctx, query, tc.id, orgID, tc.namespace, tc.kind, "preserved-or-deleted", time.Now().UTC(), time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := db.Export(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := cloneSnapshot(t, source)
+	incoming.DataSource.Rows[0][columnIndex(incoming.DataSource.Columns, "id")] = str("909")
+	incoming.DataSource.Rows[0][columnIndex(incoming.DataSource.Columns, "uid")] = str("recreated-uid")
+	incoming.DataSource.Rows[1][columnIndex(incoming.DataSource.Columns, "name")] = str("logs-renamed")
+	incoming.DataSource.Rows[1][columnIndex(incoming.DataSource.Columns, "user")] = str("new-user")
+	incoming.Secrets.Rows[0][columnIndex(incoming.Secrets.Columns, "id")] = str("911")
+	incoming.Secrets.Rows[0][columnIndex(incoming.Secrets.Columns, "value")] = str("new-ciphertext")
+	incoming.Secrets.Rows[1][columnIndex(incoming.Secrets.Columns, "namespace")] = str("logs-renamed")
+	addedDS := append([]*string(nil), incoming.DataSource.Rows[1]...)
+	addedDS[columnIndex(incoming.DataSource.Columns, "id")] = str("777")
+	addedDS[columnIndex(incoming.DataSource.Columns, "name")] = str("new-datasource")
+	addedDS[columnIndex(incoming.DataSource.Columns, "uid")] = str("new-uid")
+	incoming.DataSource.Rows = append(incoming.DataSource.Rows, addedDS)
+	addedSecret := append([]*string(nil), incoming.Secrets.Rows[1]...)
+	addedSecret[columnIndex(incoming.Secrets.Columns, "id")] = str("888")
+	addedSecret[columnIndex(incoming.Secrets.Columns, "namespace")] = str("new-datasource")
+	incoming.Secrets.Rows = append(incoming.Secrets.Rows, addedSecret)
+	incoming.DataKeys.Rows[0][columnIndex(incoming.DataKeys.Columns, "active")] = str("0")
+	addedKey := append([]*string(nil), incoming.DataKeys.Rows[0]...)
+	addedKey[columnIndex(incoming.DataKeys.Columns, "name")] = str("new-decrypt-key")
+	addedKey[columnIndex(incoming.DataKeys.Columns, "label")] = str("new-label")
+	addedKey[columnIndex(incoming.DataKeys.Columns, "active")] = str("1")
+	incoming.DataKeys.Rows = append(incoming.DataKeys.Rows, addedKey)
+	if err := incoming.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ImportWithMode(ctx, incoming, ImportSync); err == nil {
+		t.Fatal("sync bypassed deletion approval")
+	}
+	if _, err := db.Sync(ctx, incoming, SyncOptions{}); err == nil {
+		t.Fatal("sync applied without approval")
+	}
+	preview, err := db.Sync(ctx, incoming, SyncOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.DataSource != (TableResult{Inserted: 2, Updated: 1, Deleted: 1}) || preview.Secrets != (TableResult{Inserted: 2, Updated: 1, Deleted: 2}) || preview.DataKeys != (TableResult{Inserted: 1, Skipped: 2}) {
+		t.Fatalf("unexpected plan: %+v", preview)
+	}
+	assertSnapshot(t, ctx, db, before)
+	var orphanCount int
+	if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+db.quote("secrets")+" WHERE id = 444").Scan(&orphanCount); err != nil || orphanCount != 1 {
+		t.Fatal("dry-run changed orphan secret", err)
+	}
+	bad := cloneSnapshot(t, incoming)
+	bad.Secrets.Rows[0][columnIndex(bad.Secrets.Columns, "id")] = str("600")
+	if _, err := db.Sync(ctx, bad, SyncOptions{AllowDelete: true}); err == nil {
+		t.Fatal("protected secret ID overwritten")
+	}
+	assertSnapshot(t, ctx, db, before)
+	bad = cloneSnapshot(t, incoming)
+	bad.DataSource.Rows[1][columnIndex(bad.DataSource.Columns, "user")] = str(strings.Repeat("x", 256))
+	if _, err := db.Sync(ctx, bad, SyncOptions{AllowDelete: true}); err == nil {
+		t.Fatal("constraint failure ignored")
+	}
+	assertSnapshot(t, ctx, db, before)
+	bad = cloneSnapshot(t, incoming)
+	bad.DataKeys.Rows[0][columnIndex(bad.DataKeys.Columns, "encrypted_data")] = str(base64.StdEncoding.EncodeToString([]byte("wrong-key")))
+	if _, err := db.Sync(ctx, bad, SyncOptions{AllowDelete: true}); err == nil {
+		t.Fatal("incompatible key accepted")
+	}
+	assertSnapshot(t, ctx, db, before)
+	for _, column := range []string{"name", "uid"} {
+		bad = cloneSnapshot(t, incoming)
+		bad.Secrets.Rows = [][]*string{}
+		index := columnIndex(bad.DataSource.Columns, column)
+		bad.DataSource.Rows[2][index] = bad.DataSource.Rows[0][index]
+		if _, err := db.Sync(ctx, bad, SyncOptions{DryRun: true}); err == nil {
+			t.Fatalf("duplicate data source %s accepted by dry-run", column)
+		}
+	}
+	bad = cloneSnapshot(t, incoming)
+	bad.Secrets.Rows = [][]*string{}
+	bad.DataSource.Rows[2][columnIndex(bad.DataSource.Columns, "name")] = str("METRICS")
+	_, collationErr := db.Sync(ctx, bad, SyncOptions{DryRun: true})
+	if (db.Engine == "mysql" && collationErr == nil) || (db.Engine == "postgres" && collationErr != nil) {
+		t.Fatalf("dry-run did not respect target collation: %v", collationErr)
+	}
+	if db.Engine == "mysql" {
+		bad = cloneSnapshot(t, incoming)
+		bad.DataKeys.Rows[0][columnIndex(bad.DataKeys.Columns, "name")] = str("KEY-CURRENT")
+		if _, err := db.Sync(ctx, bad, SyncOptions{DryRun: true}); err == nil {
+			t.Fatal("colliding key name accepted")
+		}
+	}
+	bad = cloneSnapshot(t, incoming)
+	bad.Org.Rows, bad.DataSource.Rows, bad.Secrets.Rows = [][]*string{}, [][]*string{}, [][]*string{}
+	if _, err := db.Sync(ctx, bad, SyncOptions{AllowDelete: true}); err == nil {
+		t.Fatal("empty organization scope accepted")
+	}
+	assertSnapshot(t, ctx, db, before)
+	result, err := db.Sync(ctx, incoming, SyncOptions{AllowDelete: true})
+	if err != nil || result != preview {
+		t.Fatalf("sync result: %+v %v", result, err)
+	}
+	after, err := db.Export(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Org.Rows) != 2 || len(after.DataSource.Rows) != 4 || len(after.DataKeys.Rows) != 3 || len(after.Secrets.Rows) != 4 {
+		t.Fatalf("incorrect final scope: org=%d ds=%d keys=%d secrets=%d", len(after.Org.Rows), len(after.DataSource.Rows), len(after.DataKeys.Rows), len(after.Secrets.Rows))
+	}
+	if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+db.quote("secrets")+" WHERE id IN (333,444,600)").Scan(&orphanCount); err != nil || orphanCount != 2 {
+		t.Fatal("unrelated secret was changed or orphan not deleted", err)
+	}
+	var active bool
+	if err := db.DB.QueryRowContext(ctx, "SELECT active FROM "+db.quote("data_keys")+" WHERE name = 'new-decrypt-key'").Scan(&active); err != nil || active {
+		t.Fatal("new key was activated", err)
+	}
+	if err := db.DB.QueryRowContext(ctx, "SELECT active FROM "+db.quote("data_keys")+" WHERE name = 'key-current'").Scan(&active); err != nil || !active {
+		t.Fatal("existing key was deactivated", err)
+	}
+	assertSentinel(t, ctx, db)
+	retry, err := db.Sync(ctx, incoming, SyncOptions{AllowDelete: true})
+	if err != nil || retry.Inserted != 0 || retry.Updated != 0 || retry.Deleted != 0 {
+		t.Fatalf("sync retry changed rows: %+v %v", retry, err)
+	}
+	assertSnapshot(t, ctx, db, after)
+	swapped := cloneSnapshot(t, incoming)
+	swapped.DataSource.Rows[0][columnIndex(swapped.DataSource.Columns, "name")] = str("logs-renamed")
+	swapped.DataSource.Rows[0][columnIndex(swapped.DataSource.Columns, "uid")] = str("logs-uid")
+	swapped.DataSource.Rows[1][columnIndex(swapped.DataSource.Columns, "name")] = str("metrics")
+	swapped.DataSource.Rows[1][columnIndex(swapped.DataSource.Columns, "uid")] = str("recreated-uid")
+	swapped.Secrets.Rows[0][columnIndex(swapped.Secrets.Columns, "namespace")] = str("logs-renamed")
+	swapped.Secrets.Rows[1][columnIndex(swapped.Secrets.Columns, "namespace")] = str("metrics")
+	if _, err := db.Sync(ctx, swapped, SyncOptions{AllowDelete: true}); err != nil {
+		t.Fatal("name/UID swap failed", err)
+	}
+	retry, err = db.Sync(ctx, swapped, SyncOptions{AllowDelete: true})
+	if err != nil || retry.Updated != 0 {
+		t.Fatalf("swap did not converge: %+v %v", retry, err)
+	}
+	empty := cloneSnapshot(t, incoming)
+	empty.DataSource.Rows, empty.Secrets.Rows, empty.DataKeys.Rows = [][]*string{}, [][]*string{}, [][]*string{}
+	newOrg := append([]*string(nil), empty.Org.Rows[0]...)
+	newOrg[columnIndex(empty.Org.Columns, "id")] = str("700")
+	newOrg[columnIndex(empty.Org.Columns, "name")] = str("new-empty-org")
+	empty.Org.Rows = append(empty.Org.Rows, newOrg)
+	preview, err = db.Sync(ctx, empty, SyncOptions{DryRun: true})
+	if err != nil || preview.Org.Inserted != 1 || preview.DataSource.Deleted != 3 || preview.Secrets.Deleted != 3 {
+		t.Fatalf("empty scope plan incorrect: %+v %v", preview, err)
+	}
+	result, err = db.Sync(ctx, empty, SyncOptions{AllowDelete: true})
+	if err != nil || result != preview {
+		t.Fatalf("empty scope result incorrect: %+v %v", result, err)
+	}
+	after, err = db.Export(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Org.Rows) != 3 || len(after.DataSource.Rows) != 1 || len(after.DataKeys.Rows) != 3 || len(after.Secrets.Rows) != 1 {
+		t.Fatal("empty scope changed protected rows or retained scoped rows")
+	}
+	if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+db.quote("secrets")+" WHERE id IN (333,600)").Scan(&orphanCount); err != nil || orphanCount != 2 {
+		t.Fatal("empty scope changed protected secrets", err)
+	}
+	moving := cloneSnapshot(t, after)
+	copyDS := append([]*string(nil), moving.DataSource.Rows[0]...)
+	copyDS[columnIndex(moving.DataSource.Columns, "id")] = str("999")
+	copyDS[columnIndex(moving.DataSource.Columns, "org_id")] = str("700")
+	moving.DataSource.Rows = append(moving.DataSource.Rows, copyDS)
+	copySecret := append([]*string(nil), moving.Secrets.Rows[0]...)
+	copySecret[columnIndex(moving.Secrets.Columns, "id")] = str("999")
+	copySecret[columnIndex(moving.Secrets.Columns, "org_id")] = str("700")
+	moving.Secrets.Rows = append(moving.Secrets.Rows, copySecret)
+	if _, err := db.Sync(ctx, moving, SyncOptions{AllowDelete: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []*Table{&moving.DataSource, &moving.Secrets} {
+		index := columnIndex(table.Columns, "org_id")
+		table.Rows[0][index], table.Rows[1][index] = table.Rows[1][index], table.Rows[0][index]
+	}
+	if result, err := db.Sync(ctx, moving, SyncOptions{AllowDelete: true}); err != nil || result.Updated != 4 {
+		t.Fatalf("cross-organization logical key swap failed: %+v %v", result, err)
+	}
+	assertSnapshot(t, ctx, db, moving)
+	assertSentinel(t, ctx, db)
+}
+
 func createFixtures(t *testing.T, ctx context.Context, db *Database) {
 	t.Helper()
 	id, boolType, stamp, blob, suffix := "BIGSERIAL PRIMARY KEY", "BOOLEAN", "TIMESTAMP(6)", "BYTEA", ""
@@ -346,7 +559,7 @@ func createFixtures(t *testing.T, ctx context.Context, db *Database) {
 	}
 	statements := map[string]string{
 		"org":         "CREATE TABLE " + db.quote("org") + " (id " + id + ", version INT NOT NULL, name VARCHAR(190) NOT NULL UNIQUE, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, note TEXT NULL)" + suffix,
-		"data_source": "CREATE TABLE " + db.quote("data_source") + " (id " + id + ", org_id BIGINT NOT NULL, version INT NOT NULL, name VARCHAR(190) NOT NULL, " + db.quote("user") + " VARCHAR(255), " + db.quote("database") + " VARCHAR(255), basic_auth " + boolType + " NOT NULL, is_default " + boolType + " NOT NULL, read_only " + boolType + " NULL, json_data TEXT, secure_json_data TEXT, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name))" + suffix,
+		"data_source": "CREATE TABLE " + db.quote("data_source") + " (id " + id + ", org_id BIGINT NOT NULL, version INT NOT NULL, name VARCHAR(190) NOT NULL, uid VARCHAR(40) NOT NULL, " + db.quote("user") + " VARCHAR(255), " + db.quote("database") + " VARCHAR(255), basic_auth " + boolType + " NOT NULL, is_default " + boolType + " NOT NULL, read_only " + boolType + " NULL, json_data TEXT, secure_json_data TEXT, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name), UNIQUE(org_id,uid))" + suffix,
 		"dashboard":   "CREATE TABLE " + db.quote("dashboard") + " (id BIGINT PRIMARY KEY, title VARCHAR(255))" + suffix,
 		"data_keys":   "CREATE TABLE " + db.quote("data_keys") + " (name VARCHAR(100) PRIMARY KEY, active " + boolType + ", scope VARCHAR(30) NOT NULL, provider VARCHAR(50) NOT NULL, encrypted_data " + blob + " NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, label VARCHAR(100) NOT NULL)" + suffix,
 		"secrets":     "CREATE TABLE " + db.quote("secrets") + " (id " + id + ", org_id BIGINT NOT NULL, namespace VARCHAR(255) NOT NULL, " + db.quote("type") + " VARCHAR(255) NOT NULL, value TEXT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,namespace," + db.quote("type") + "))" + suffix,
@@ -371,9 +584,9 @@ func seedFixtures(t *testing.T, ctx context.Context, db *Database) {
 	stamp := time.Date(2025, 1, 2, 3, 4, 5, 123456000, time.UTC).Format(time.RFC3339Nano)
 	s := &Snapshot{Version: 2,
 		Org: Table{Columns: []string{"id", "version", "name", "created", "updated", "note"}, Rows: [][]*string{{str("9007199254740993"), str("1"), str("組織 'A'"), str(stamp), str(stamp), nil}}},
-		DataSource: Table{Columns: []string{"id", "org_id", "version", "name", "user", "database", "basic_auth", "is_default", "read_only", "json_data", "secure_json_data", "created", "updated"}, Rows: [][]*string{
-			{str("42"), str("9007199254740993"), str("1"), str("metrics"), str(""), nil, str("1"), str("1"), nil, str(`{"text":"日本語","quote":"'"}`), str("opaque-encrypted-value"), str(stamp), str(stamp)},
-			{str("88"), str("9007199254740993"), str("2"), str("logs"), nil, str(""), str("0"), str("0"), str("0"), str("{}"), str(""), str(stamp), str(stamp)},
+		DataSource: Table{Columns: []string{"id", "org_id", "version", "name", "uid", "user", "database", "basic_auth", "is_default", "read_only", "json_data", "secure_json_data", "created", "updated"}, Rows: [][]*string{
+			{str("42"), str("9007199254740993"), str("1"), str("metrics"), str("metrics-uid"), str(""), nil, str("1"), str("1"), nil, str(`{"text":"日本語","quote":"'"}`), str("opaque-encrypted-value"), str(stamp), str(stamp)},
+			{str("88"), str("9007199254740993"), str("2"), str("logs"), str("logs-uid"), nil, str(""), str("0"), str("0"), str("0"), str("{}"), str(""), str(stamp), str(stamp)},
 		}},
 		DataKeys: Table{Columns: []string{"name", "active", "scope", "provider", "encrypted_data", "created", "updated", "label"}, BinaryColumns: []string{"encrypted_data"}, Rows: [][]*string{
 			{str("key-current"), str("1"), str("global"), str("secretKey.v1"), str(base64.StdEncoding.EncodeToString([]byte{0, 255, 128, 0, 10, 13})), str(stamp), str(stamp), str("current-label")},

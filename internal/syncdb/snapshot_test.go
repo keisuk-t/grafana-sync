@@ -159,6 +159,32 @@ func TestInvalidImportModeDoesNotConnect(t *testing.T) {
 	}
 }
 
+func TestInvalidSyncDoesNotConnect(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Snapshot)
+	}{
+		{"missing active", func(s *Snapshot) { s.DataKeys.Columns[2] = "other" }},
+		{"missing org name", func(s *Snapshot) { s.Org.Columns[1] = "other" }},
+		{"empty scope", func(s *Snapshot) {
+			s.Org.Rows, s.DataSource.Rows, s.Secrets.Rows = [][]*string{}, [][]*string{}, [][]*string{}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := validSnapshot()
+			s.DataKeys.Columns = append(s.DataKeys.Columns, "active")
+			s.DataKeys.Rows[0] = append(s.DataKeys.Rows[0], str("1"))
+			tc.mutate(s)
+			if _, err := (&Database{}).Sync(context.Background(), s, SyncOptions{DryRun: true}); err == nil {
+				t.Fatal("invalid sync accepted")
+			}
+		})
+	}
+	if _, err := (&Database{}).Sync(context.Background(), validSnapshot(), SyncOptions{}); err == nil {
+		t.Fatal("missing deletion approval accepted")
+	}
+}
+
 func TestOpenDoesNotExposeDSN(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres", "sqlite"} {
 		_, err := Open(context.Background(), engine, "not-a-dsn/secret-password%")

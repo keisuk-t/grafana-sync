@@ -35,7 +35,7 @@ func TestImportModesWithDatabase(t *testing.T) {
 			for name, columns := range map[string]string{
 				"org":         "id BIGINT PRIMARY KEY, name VARCHAR(100)",
 				"data_source": "id BIGINT PRIMARY KEY, org_id BIGINT, name VARCHAR(100)",
-				"data_keys":   "name VARCHAR(100) PRIMARY KEY, encrypted_data " + blob,
+				"data_keys":   "name VARCHAR(100) PRIMARY KEY, active SMALLINT NOT NULL, encrypted_data " + blob,
 				"secrets":     "id BIGINT PRIMARY KEY, org_id BIGINT, namespace VARCHAR(100), type VARCHAR(100), value TEXT",
 			} {
 				if _, err := db.DB.ExecContext(ctx, "CREATE TABLE "+name+" ("+columns+")"+suffix); err != nil {
@@ -51,7 +51,7 @@ func TestImportModesWithDatabase(t *testing.T) {
 			s := &syncdb.Snapshot{Version: 2,
 				Org:        syncdb.Table{Columns: []string{"id", "name"}, Rows: [][]*string{{ptr("1"), ptr("original")}}},
 				DataSource: syncdb.Table{Columns: []string{"id", "org_id", "name"}, Rows: [][]*string{{ptr("1"), ptr("1"), ptr("metrics")}}},
-				DataKeys:   syncdb.Table{Columns: []string{"name", "encrypted_data"}, BinaryColumns: []string{"encrypted_data"}, Rows: [][]*string{{ptr("key"), ptr("AP+A")}}},
+				DataKeys:   syncdb.Table{Columns: []string{"name", "active", "encrypted_data"}, BinaryColumns: []string{"encrypted_data"}, Rows: [][]*string{{ptr("key"), ptr("1"), ptr("AP+A")}}},
 				Secrets:    syncdb.Table{Columns: []string{"id", "org_id", "namespace", "type", "value"}, Rows: [][]*string{{ptr("1"), ptr("1"), ptr("metrics"), ptr("datasource"), ptr("opaque")}}},
 			}
 			path := filepath.Join(t.TempDir(), "initial.json")
@@ -89,6 +89,39 @@ func TestImportModesWithDatabase(t *testing.T) {
 			}
 			if err := Run(ctx, []string{"import", "-db", engine, "-file", path}, &out, &bytes.Buffer{}); err == nil {
 				t.Fatal("default mode accepted populated tables")
+			}
+			s.DataSource.Rows[0][0] = ptr("2")
+			s.Secrets.Rows[0][0] = ptr("2")
+			path = filepath.Join(t.TempDir(), "sync.json")
+			if err := writeSnapshot(path, s); err != nil {
+				t.Fatal(err)
+			}
+			if err := Run(ctx, []string{"import", "-db", engine, "-file", path, "--mode", "sync"}, &out, &bytes.Buffer{}); err == nil {
+				t.Fatal("sync accepted missing deletion approval")
+			}
+			runSync := func(option string) string {
+				t.Helper()
+				out.Reset()
+				if err := Run(ctx, []string{"import", "-db", engine, "-file", path, "--mode", "sync", option}, &out, &bytes.Buffer{}); err != nil {
+					t.Fatal(err)
+				}
+				return out.String()
+			}
+			if got := runSync("--dry-run"); !strings.Contains(got, "sync planned (no changes applied): inserted=2 updated=0 deleted=2") || !strings.Contains(got, "data_source: inserted=1 updated=0 deleted=1") {
+				t.Fatalf("unexpected sync preview: %q", got)
+			}
+			var count int
+			if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM data_source WHERE id = 1").Scan(&count); err != nil || count != 1 {
+				t.Fatal("dry-run changed target", err)
+			}
+			if got := runSync("--allow-delete"); !strings.Contains(got, "sync completed: inserted=2 updated=0 deleted=2") {
+				t.Fatalf("unexpected sync result: %q", got)
+			}
+			if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM data_source WHERE id = 1").Scan(&count); err != nil || count != 0 {
+				t.Fatal("old data source remains", err)
+			}
+			if got := runSync("--allow-delete"); !strings.Contains(got, "sync completed: inserted=0 updated=0 deleted=0") {
+				t.Fatalf("retry was not idempotent: %q", got)
 			}
 		})
 	}

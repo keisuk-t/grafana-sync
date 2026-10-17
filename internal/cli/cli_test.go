@@ -93,7 +93,21 @@ func TestImportModeFlag(t *testing.T) {
 	if err := Run(context.Background(), []string{"import", "--help"}, &bytes.Buffer{}, &out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "require-empty or insert-only") {
+	if !strings.Contains(out.String(), "require-empty, insert-only or sync") {
 		t.Fatal("help omits import modes")
+	}
+	for _, args := range [][]string{
+		{"import", "-db", "mysql", "-file", "missing.json", "--mode", "sync"},
+		{"import", "-db", "mysql", "-file", "missing.json", "--dry-run"},
+		{"import", "-db", "mysql", "-file", "missing.json", "--allow-delete"},
+	} {
+		if err := Run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || strings.Contains(err.Error(), "DSN") {
+			t.Fatalf("accepted unapproved sync/invalid option: %v %v", args, err)
+		}
+	}
+	for _, option := range []string{"--dry-run", "--allow-delete"} {
+		if err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", "missing.json", "--mode", "sync", option}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || err.Error() != "DSN environment variable is unset or empty" {
+			t.Fatalf("rejected approved sync: %v", err)
+		}
 	}
 }

@@ -15,18 +15,34 @@ type ImportMode string
 const (
 	ImportRequireEmpty ImportMode = "require-empty"
 	ImportInsertOnly   ImportMode = "insert-only"
+	ImportSync         ImportMode = "sync"
 )
 
 func (mode ImportMode) Validate() error {
-	if mode != ImportRequireEmpty && mode != ImportInsertOnly {
-		return errors.New("import mode must be require-empty or insert-only")
+	if mode != ImportRequireEmpty && mode != ImportInsertOnly && mode != ImportSync {
+		return errors.New("import mode must be require-empty, insert-only or sync")
 	}
 	return nil
 }
 
 type ImportResult struct {
-	Inserted int
-	Skipped  int
+	Inserted   int
+	Skipped    int
+	Updated    int
+	Deleted    int
+	Unchanged  int
+	Org        TableResult
+	DataKeys   TableResult
+	DataSource TableResult
+	Secrets    TableResult
+}
+
+type TableResult struct {
+	Inserted  int
+	Updated   int
+	Deleted   int
+	Unchanged int
+	Skipped   int
 }
 
 func (d *Database) Import(ctx context.Context, s *Snapshot) error {
@@ -37,6 +53,9 @@ func (d *Database) Import(ctx context.Context, s *Snapshot) error {
 func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportMode) (ImportResult, error) {
 	if err := mode.Validate(); err != nil {
 		return ImportResult{}, err
+	}
+	if mode == ImportSync {
+		return ImportResult{}, errors.New("sync requires Sync with an explicit dry-run or deletion approval")
 	}
 	if err := s.Validate(); err != nil {
 		return ImportResult{}, err
