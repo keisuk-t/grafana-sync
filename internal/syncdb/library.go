@@ -52,15 +52,20 @@ func libraryReferences(data string) ([]string, error) {
 }
 
 func validateLibraryModelReferences(model map[string]any, uid string) error {
-	// Grafana can persist a top-level descriptor of the library panel itself.
+	// Grafana can persist top-level metadata with no UID or the panel's own UID.
 	if value := model["libraryPanel"]; value != nil {
 		panel, ok := value.(map[string]any)
-		stored, _ := panel["uid"].(string)
-		if !ok || stored == "" {
+		if !ok {
 			return errors.New("invalid top-level libraryPanel metadata")
 		}
-		if stored != uid {
-			return errors.New("library panel model references another library panel at its root; nested library panel references are unsupported")
+		if value, exists := panel["uid"]; exists {
+			stored, ok := value.(string)
+			if !ok || stored == "" {
+				return errors.New("invalid top-level libraryPanel metadata")
+			}
+			if stored != uid {
+				return errors.New("library panel model references another library panel at its root; nested library panel references are unsupported")
+			}
 		}
 	}
 	nested := false

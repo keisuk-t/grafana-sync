@@ -182,11 +182,14 @@ func TestLibraryModelSelfMetadata(t *testing.T) {
 			{"null", `{"libraryPanel":null}`, ""},
 			{"self", `{"libraryPanel":{"uid":"shared"}}`, ""},
 			{"self metadata", ` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"shared","name":"stale-name-canary","version":1},"options":{"text":"content-canary"}} `, ""},
+			{"empty metadata object", `{"libraryPanel":{}}`, ""},
+			{"missing UID", `{"libraryPanel":{"name":"private-name-canary"}}`, ""},
+			{"metadata without UID", ` {"uid":"shared","type":"timeseries","libraryPanel":{"name":"stale-name-canary","version":1},"options":{"text":"content-canary"}} `, ""},
 			{"nested null", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":null}}`, ""},
 			{"foreign", `{"libraryPanel":{"uid":"foreign-uid-canary","name":"private-name-canary"}}`, "references another library panel at its root"},
 			{"empty UID", `{"libraryPanel":{"uid":""}}`, "invalid top-level libraryPanel metadata"},
-			{"missing UID", `{"libraryPanel":{"name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
 			{"null UID", `{"libraryPanel":{"uid":null}}`, "invalid top-level libraryPanel metadata"},
+			{"boolean UID", `{"libraryPanel":{"uid":false}}`, "invalid top-level libraryPanel metadata"},
 			{"numeric UID", `{"libraryPanel":{"uid":40}}`, "invalid top-level libraryPanel metadata"},
 			{"object UID", `{"libraryPanel":{"uid":{"uid":"shared"}}}`, "invalid top-level libraryPanel metadata"},
 			{"nonobject", `{"libraryPanel":"private-value-canary"}`, "invalid top-level libraryPanel metadata"},
@@ -196,6 +199,9 @@ func TestLibraryModelSelfMetadata(t *testing.T) {
 			{"self and nested", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
 			{"nested within metadata", `{"libraryPanel":{"uid":"shared","extra":{"libraryPanel":{"uid":"shared"}}}}`, "below the model root"},
 			{"nested malformed", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{}}}`, "below the model root"},
+			{"missing UID and nested self", `{"libraryPanel":{"name":"private-name-canary"},"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
+			{"nested within UIDless metadata", `{"libraryPanel":{"extra":{"libraryPanel":{"uid":"foreign-uid-canary"}}}}`, "below the model root"},
+			{"malformed within UIDless metadata", `{"libraryPanel":{"extra":{"libraryPanel":{}}}}`, "below the model root"},
 		} {
 			t.Run(version.name+"/"+tc.name, func(t *testing.T) {
 				s := version.make()
@@ -223,6 +229,30 @@ func TestLibraryModelSelfMetadata(t *testing.T) {
 					t.Fatal("model validation modified the snapshot", err)
 				}
 			})
+		}
+	}
+}
+
+func TestUIDlessLibraryMetadataDoesNotRelaxDashboardReferences(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		make func() *Snapshot
+	}{{"v4", librarySnapshot}, {"v5", rbacSnapshot}} {
+		for _, table := range []string{"dashboard", "dashboard_version"} {
+			for _, metadata := range []string{`{}`, `{"name":"private-name-canary"}`} {
+				t.Run(version.name+"/"+table+"/"+metadata, func(t *testing.T) {
+					s := version.make()
+					s.LibraryElement.Rows[0][columnIndex(s.LibraryElement.Columns, "model")] = str(`{"libraryPanel":{"name":"private-name-canary"}}`)
+					target, row := &s.Dashboard, 2
+					if table == "dashboard_version" {
+						target, row = &s.DashboardVersion, 0
+					}
+					target.Rows[row][columnIndex(target.Columns, "data")] = str(`{"panels":[{"libraryPanel":` + metadata + `}]}`)
+					if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "invalid library panel reference") || strings.Contains(err.Error(), "canary") {
+						t.Fatal("UIDless model metadata relaxed dashboard/history references", err)
+					}
+				})
+			}
 		}
 	}
 }
