@@ -258,6 +258,133 @@ func TestDashboardTransfer(t *testing.T) {
 	}
 }
 
+func TestDashboardTagOrphans(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	databases, snapshots := map[string]*Database{}, map[string]*Snapshot{}
+	for _, engine := range []string{"mysql", "postgres"} {
+		db, err := Open(ctx, engine, os.Getenv(strings.ToUpper(engine)+"_TEST_DSN"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.DB.Close() })
+		createDashboardFixtures(t, ctx, db)
+		source := seedDashboardFixtures(t, ctx, db)
+		databases[engine] = db
+		t.Run(engine+"_export", func(t *testing.T) {
+			snapshots[engine] = testDashboardTagOrphanExport(t, ctx, db, source)
+		})
+	}
+	for source, snapshot := range snapshots {
+		for target, db := range databases {
+			for _, mode := range []ImportMode{ImportRequireEmpty, ImportInsertOnly, ImportSync} {
+				t.Run(source+"_to_"+target+"/"+string(mode), func(t *testing.T) {
+					clearDashboardFixtures(t, ctx, db)
+					if mode == ImportSync {
+						before := dashboardDatabaseState(t, ctx, db)
+						if _, err := db.Sync(ctx, snapshot, SyncOptions{DryRun: true}); err != nil {
+							t.Fatal(err)
+						}
+						if before != dashboardDatabaseState(t, ctx, db) {
+							t.Fatal("dry-run modified the target")
+						}
+						if _, err := db.Sync(ctx, snapshot, SyncOptions{AllowDelete: true}); err != nil {
+							t.Fatal(err)
+						}
+					} else if _, err := db.ImportWithMode(ctx, snapshot, mode); err != nil {
+						t.Fatal(err)
+					}
+					got, err := db.ExportTargets(ctx, AllTargets)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := cloneSnapshot(t, snapshot)
+					if mode == ImportSync {
+						for _, row := range want.DataKeys.Rows {
+							row[columnIndex(want.DataKeys.Columns, "active")] = str("0")
+						}
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatal("orphan filtering changed the migrated snapshot")
+					}
+				})
+			}
+		}
+	}
+}
+
+func testDashboardTagOrphanExport(t *testing.T, ctx context.Context, db *Database, source *Snapshot) *Snapshot {
+	t.Helper()
+	org := cell(source.Dashboard, source.Dashboard.Rows[2], "org_id")
+	data := `{"title":"ボード","tags":["タグ","retained-json-tag"],"panels":[]}`
+	if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard SET data = "+db.bind(1)+" WHERE id = 12", data); err != nil {
+		t.Fatal(err)
+	}
+	// A UID in a different organization must not rescue an orphan tag.
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO "+db.quote("org")+" (id, version, name, created, updated) VALUES (77, 1, 'other-org', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard (id, org_id, uid, title, data, version, is_folder, folder_id, has_acl, is_public) VALUES (77, 77, 'deleted-0', 'Other board', '{}', 1, FALSE, 0, FALSE, FALSE)"); err != nil {
+		t.Fatal(err)
+	}
+	want, err := db.ExportTargets(ctx, AllTargets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_tag (id, dashboard_id, term, org_id, dashboard_uid) VALUES ("+db.bindList(5)+")", 201+i, 12, "stale-tag-"+strconv.Itoa(i), org, "deleted-"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := dashboardDatabaseState(t, ctx, db)
+	got, err := db.ExportTargets(ctx, AllTargets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) || len(got.DashboardTag.Rows) != 1 || cell(got.Dashboard, syncRowsByID(got.Dashboard, "id")[12], "data") != data {
+		t.Fatal("export did not exclude exactly the eight UID orphans or modified dashboard JSON")
+	}
+	if before != dashboardDatabaseState(t, ctx, db) {
+		t.Fatal("export modified source rows or sequences")
+	}
+	cases := []struct {
+		name, column string
+		value        any
+	}{
+		{"existing UID", "dashboard_uid", "child"},
+		{"null UID", "dashboard_uid", nil},
+		{"empty UID", "dashboard_uid", ""},
+		{"other organization", "org_id", "77"},
+		{"null organization", "org_id", nil},
+		{"zero organization", "org_id", "0"},
+	}
+	if db.Engine == "mysql" {
+		cases = append(cases, struct {
+			name, column string
+			value        any
+		}{"collation-only UID", "dashboard_uid", "BOARD"})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard_tag SET "+db.quote(tc.column)+" = "+db.bind(1)+" WHERE id = 200", tc.value); err != nil {
+				t.Fatal(err)
+			}
+			before := dashboardDatabaseState(t, ctx, db)
+			_, err := db.ExportTargets(ctx, AllTargets)
+			if err == nil || !strings.Contains(err.Error(), "dashboard tag metadata differs from its parent: "+tc.column+" (tag ID 200, dashboard ID 12)") {
+				t.Fatal("export silently discarded ambiguous tag metadata", err)
+			}
+			if before != dashboardDatabaseState(t, ctx, db) {
+				t.Fatal("failed export modified the source")
+			}
+			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard_tag SET org_id = "+db.bind(1)+", dashboard_uid = 'board' WHERE id = 200", org); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	return got
+}
+
 func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, source *Snapshot) {
 	large := cloneSnapshot(t, source)
 	org := cell(large.Dashboard, large.Dashboard.Rows[2], "org_id")

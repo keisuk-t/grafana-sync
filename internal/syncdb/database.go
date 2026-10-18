@@ -174,6 +174,16 @@ func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) 
 	if name == "dashboard_tag" || name == "dashboard_version" {
 		query += " WHERE EXISTS (SELECT 1 FROM " + d.quote("dashboard") + " WHERE " + d.quote("dashboard") + "." + d.quote("id") + " = " + d.quote(name) + "." + d.quote("dashboard_id") + ")"
 	}
+	if name == "dashboard_tag" {
+		// Retain ambiguous metadata for validation; omit only unambiguous UID orphans.
+		query += fmt.Sprintf(` AND (
+			%[1]s.org_id IS NULL OR %[1]s.dashboard_uid IS NULL OR %[1]s.dashboard_uid = ''
+			OR EXISTS (SELECT 1 FROM %[2]s parent
+				WHERE parent.id = %[1]s.dashboard_id AND parent.org_id <> %[1]s.org_id)
+			OR EXISTS (SELECT 1 FROM %[2]s resource
+				WHERE resource.org_id = %[1]s.org_id AND resource.uid = %[1]s.dashboard_uid)
+		)`, d.quote(name), d.quote("dashboard"))
+	}
 	rows, err := tx.QueryContext(ctx, query+" ORDER BY "+d.quote(entry.key))
 	if err != nil {
 		return Table{}, fmt.Errorf("cannot read %s", name)

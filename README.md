@@ -10,7 +10,7 @@ Grafana の組織・データソース・ダッシュボードを JSON にエク
 | `secrets` | `type = 'datasource'` かつ `org_id`・`namespace` が移行するデータソースの `org_id`・`name` に一致する行のみ |
 | `dashboard` | `dashboard` 対象選択時のみ。通常のダッシュボードと `is_folder=1` のフォルダ行 |
 | `folder` | `dashboard` 対象選択時のみ。ルート／ネストフォルダの階層情報 |
-| `dashboard_tag`・`dashboard_version` | `dashboard` 対象選択時のみ。対象ダッシュボードのタグと保存履歴（孤立行は除外） |
+| `dashboard_tag`・`dashboard_version` | `dashboard` 対象選択時のみ。対象ダッシュボードのタグと保存履歴（孤立行は除外。タグは下記のUID検査も実施） |
 | `library_element`・`library_element_connection` | `dashboard` 対象選択時のみ。ライブラリパネル本体（未使用のものも含む）とダッシュボードへの関連付け |
 | リソース権限・ロール依存 | `dashboard` 選択時のみ。Viewer／Editor／Admin、個別ユーザー・チーム、組織専用ロールと対応する旧ACL。共有・グローバルロールは既存定義との一致を要求 |
 
@@ -142,6 +142,7 @@ DB エラーに機密カラム値が含まれる場合があるため、生の�
 **Grafana 12.2.0 の従来 SQL storage と、Grafana 12.4.3 の SQL スキーマを検証対象とします。Unified Storage・dual-write・移行中の状態には対応しません。** `kv_store` の保存方式フラグに加え、`resource` に Unified Storage のダッシュボード／フォルダが存在する場合もエラーにします。Grafana 12.4.3 の既定構成では API 経由の新規ダッシュボードが Unified Storage に保存される場合があるため、移行元・先とも従来 SQL storage のみで動作していることを管理者側でも確認してください。DB 外の設定は移行しません。
 
 - ID／UID を保持します。フォルダ階層・タグ・全保存履歴を扱い、孤立参照・循環・タイトルや UID の不整合を拒否します。
+- export では、親の `dashboard_id` が存在しないタグ・履歴を除外します。また、タグの組織 ID が ID 参照先と一致し、空でない `dashboard_uid` の参照先が同じ組織に存在しない場合、そのタグ行も孤立行として除外します（Grafana 12.4.3 のタグ参照は組織 ID＋UID）。元 DB とダッシュボード本体の JSON 内のタグは変更しません。組織 ID の不一致、UID が別の既存ダッシュボードを指す場合、NULL／空 UID は引き続き拒否し、推測で修復しません。import／sync の JSON 検証も緩和しません。
 - `require-empty` は選択した6テーブル（version 3 入力では4テーブル）が空であることを要求します。対象UIDの既存権限も競合として拒否します。`insert-only` は既存 dashboard ID を優先し、その配下のタグ・履歴・パネル関連付け・権限を追記しません。既存 library element ID の定義や権限も更新しませんが、新規ダッシュボードから既存パネルへの整合する関連付けは追加できます。
 - `sync` は scope 内のフォルダ・ダッシュボード・タグ・履歴・ライブラリパネルと関連付け・標準権限を同期します。再作成、UID／名前の交換、フォルダ移動に対応し、対象外組織は保持します。
 - ライブラリパネルは ID／UID と model JSON を保持します。通常のパネル（`kind=1`）とダッシュボードへの関連付け（`kind=1`）のみ対応し、未知の種類・欠落した本体／ダッシュボード・組織をまたぐ関連付け・不整合なフォルダ参照は拒否します。本体・履歴 JSON の `libraryPanel.uid` を解決し、現行本体の参照には対応する関連付けも要求します。履歴からのみ参照するパネルも本体が必要です。

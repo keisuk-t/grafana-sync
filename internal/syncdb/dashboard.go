@@ -155,8 +155,17 @@ func (s *Snapshot) validateDashboardState(scope map[int64]bool, payload bool) er
 			}
 			keys[key] = true
 			if spec.name == "dashboard_tag" {
-				if cell(spec.table, row, "term") == "" || rowOrg(spec.table, row) != rowOrg(s.Dashboard, parent) || cell(spec.table, row, "dashboard_uid") != cell(s.Dashboard, parent, "uid") {
-					return errors.New("dashboard tag metadata differs from its parent")
+				if cell(spec.table, row, "term") == "" {
+					return errors.New("dashboard tag term is empty")
+				}
+				column := ""
+				if rowOrg(spec.table, row) != rowOrg(s.Dashboard, parent) {
+					column = "org_id"
+				} else if cell(spec.table, row, "dashboard_uid") != cell(s.Dashboard, parent, "uid") {
+					column = "dashboard_uid"
+				}
+				if column != "" {
+					return fmt.Errorf("dashboard tag metadata differs from its parent: %s (tag ID %s, dashboard ID %d)", column, cell(spec.table, row, "id"), id)
 				}
 			} else {
 				if _, err := positiveID(row[columnIndex(spec.table.Columns, "version")]); err != nil {

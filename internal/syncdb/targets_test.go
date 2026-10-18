@@ -137,6 +137,42 @@ func TestDashboardValidation(t *testing.T) {
 	}
 }
 
+func TestDashboardTagMetadataDiagnostics(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		make func() *Snapshot
+	}{{"v3", dashboardSnapshot}, {"v4", librarySnapshot}, {"v5", rbacSnapshot}} {
+		for _, tc := range []struct {
+			name, column, want string
+			value              *string
+		}{
+			{"missing UID", "dashboard_uid", "dashboard_uid", str("sensitive-missing-uid")},
+			{"other dashboard UID", "dashboard_uid", "dashboard_uid", str("child")},
+			{"null UID", "dashboard_uid", "dashboard_uid", nil},
+			{"empty UID", "dashboard_uid", "dashboard_uid", str("")},
+			{"other organization", "org_id", "org_id", str("77")},
+			{"null organization", "org_id", "org_id", nil},
+			{"empty term", "term", "dashboard tag term is empty", str("")},
+		} {
+			t.Run(version.name+"/"+tc.name, func(t *testing.T) {
+				s := version.make()
+				s.DashboardTag.Rows[0][columnIndex(s.DashboardTag.Columns, tc.column)] = tc.value
+				want := tc.want
+				if tc.column != "term" {
+					want = "dashboard tag metadata differs from its parent: " + tc.want + " (tag ID 200, dashboard ID 12)"
+				}
+				err := s.Validate()
+				if err == nil || err.Error() != want {
+					t.Fatalf("unexpected diagnostic: %v", err)
+				}
+				if strings.Contains(err.Error(), "sensitive-missing-uid") {
+					t.Fatal("diagnostic includes a UID value")
+				}
+			})
+		}
+	}
+}
+
 func TestSnapshotEnvelopeFields(t *testing.T) {
 	legacy, err := json.Marshal(validSnapshot())
 	if err != nil {
