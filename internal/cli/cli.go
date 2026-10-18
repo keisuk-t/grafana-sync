@@ -176,6 +176,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		snapshot = result.Snapshot
+		if result.OmittedOrphanLibraryConnections > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: omitted %d orphan library connections from export JSON only because their dashboards do not exist; source database unchanged\n", result.OmittedOrphanLibraryConnections); err != nil {
+				return err
+			}
+		}
 		if result.RehomedLibraryPanels > 0 {
 			if _, err := fmt.Fprintf(stderr, "warning: rehomed %d orphan library panels to General in export JSON only; source database unchanged; folder-inherited access may change\n", result.RehomedLibraryPanels); err != nil {
 				return err

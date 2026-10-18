@@ -113,6 +113,41 @@ func (s *Snapshot) renameRehomedLibraryPanels(moved map[string]bool) (int, error
 	return renamed, nil
 }
 
+func (s *Snapshot) omitOrphanLibraryConnections() (int, error) {
+	for _, entry := range []struct {
+		table   Table
+		name    string
+		columns []string
+	}{
+		{s.LibraryConnection, "library_element_connection", []string{"id", "element_id", "kind", "connection_id"}},
+		{s.LibraryElement, "library_element", []string{"id"}},
+		{s.Dashboard, "dashboard", []string{"id"}},
+	} {
+		if err := requireColumns(entry.table, entry.name, entry.columns...); err != nil {
+			return 0, err
+		}
+	}
+	dashboards := syncRowsByID(s.Dashboard, "id")
+	libraries := syncRowsByID(s.LibraryElement, "id")
+	rows := make([][]*string, 0, len(s.LibraryConnection.Rows))
+	omitted := 0
+	for _, row := range s.LibraryConnection.Rows {
+		_, rowErr := syncID(row, s.LibraryConnection.Columns, "id")
+		element, elementErr := syncID(row, s.LibraryConnection.Columns, "element_id")
+		id, idErr := syncID(row, s.LibraryConnection.Columns, "connection_id")
+		// Retain malformed rows for validation; omit only missing dashboard references.
+		if rowErr == nil && cell(s.LibraryConnection, row, "kind") == "1" && elementErr == nil && libraries[element] != nil && idErr == nil && dashboards[id] == nil {
+			omitted++
+			continue
+		}
+		rows = append(rows, row)
+	}
+	if omitted > 0 {
+		s.LibraryConnection.Rows = rows
+	}
+	return omitted, nil
+}
+
 func libraryReferences(data string) ([]string, error) {
 	document, err := dashboardDocument(data)
 	if err != nil {

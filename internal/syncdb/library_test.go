@@ -227,6 +227,86 @@ func TestRenameRehomedLibraryPanelsDoesNotRepairOtherCollisions(t *testing.T) {
 	}
 }
 
+func TestOmitOrphanLibraryConnections(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		make func() *Snapshot
+	}{{"v4", librarySnapshot}, {"v5", rbacSnapshot}} {
+		t.Run(version.name, func(t *testing.T) {
+			s := version.make()
+			s.Dashboard.Rows = s.Dashboard.Rows[:len(s.Dashboard.Rows)-6]
+			want := version.make()
+			want.Dashboard.Rows = want.Dashboard.Rows[:len(want.Dashboard.Rows)-6]
+			want.LibraryConnection.Rows = want.LibraryConnection.Rows[:8]
+			if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "missing dashboard") {
+				t.Fatal("input validation accepted orphan connections", err)
+			}
+			if count, err := s.omitOrphanLibraryConnections(); err != nil || count != 6 || !reflect.DeepEqual(s, want) {
+				t.Fatal("omission changed more than the six orphan connections", count, err)
+			}
+			if err := s.Validate(); err != nil {
+				t.Fatal("filtered snapshot is invalid", err)
+			}
+			if count, err := s.omitOrphanLibraryConnections(); err != nil || count != 0 || !reflect.DeepEqual(s, want) {
+				t.Fatal("connection omission is not idempotent", count, err)
+			}
+		})
+	}
+}
+
+func TestOmitOrphanLibraryConnectionsPreservesInvalidRows(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  []*string
+	}{
+		{"unknown kind", []*string{str("200"), str("40"), str("2"), str("999")}},
+		{"NULL kind", []*string{str("200"), str("40"), nil, str("999")}},
+		{"missing element", []*string{str("200"), str("999"), str("1"), str("12")}},
+		{"both missing", []*string{str("200"), str("999"), str("1"), str("999")}},
+		{"NULL element", []*string{str("200"), nil, str("1"), str("999")}},
+		{"invalid element", []*string{str("200"), str("invalid"), str("1"), str("999")}},
+		{"NULL dashboard", []*string{str("200"), str("40"), str("1"), nil}},
+		{"zero dashboard", []*string{str("200"), str("40"), str("1"), str("0")}},
+		{"negative dashboard", []*string{str("200"), str("40"), str("1"), str("-1")}},
+		{"invalid dashboard", []*string{str("200"), str("40"), str("1"), str("invalid")}},
+		{"NULL row ID", []*string{nil, str("40"), str("1"), str("999")}},
+		{"zero row ID", []*string{str("0"), str("40"), str("1"), str("999")}},
+		{"negative row ID", []*string{str("-1"), str("40"), str("1"), str("999")}},
+		{"duplicate connection", []*string{str("200"), str("40"), str("1"), str("12")}},
+		{"folder reference", []*string{str("200"), str("40"), str("1"), str("11")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := librarySnapshot()
+			s.LibraryConnection.Rows = append(s.LibraryConnection.Rows, tc.row)
+			before, err := json.Marshal(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count, err := s.omitOrphanLibraryConnections(); err != nil || count != 0 {
+				t.Fatal("omitted malformed or live connection", count, err)
+			}
+			after, err := json.Marshal(s)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("modified invalid input", err)
+			}
+			if err := s.Validate(); err == nil {
+				t.Fatal("validation accepted retained invalid connection")
+			}
+		})
+	}
+	s := librarySnapshot()
+	row := append([]*string{}, s.Dashboard.Rows[2]...)
+	row[0], row[1], row[2] = str("77"), str("77"), str("other-board")
+	s.Dashboard.Rows = append(s.Dashboard.Rows, row)
+	s.LibraryConnection.Rows[0][3] = str("77")
+	if count, err := s.omitOrphanLibraryConnections(); err != nil || count != 0 {
+		t.Fatal("omitted a cross-organization connection", count, err)
+	}
+	if err := s.validateLibraryState(map[int64]bool{9007199254740993: true, 77: true}); err == nil || !strings.Contains(err.Error(), "another organization") {
+		t.Fatal("accepted a cross-organization connection", err)
+	}
+}
+
 func librarySnapshot() *Snapshot {
 	s := dashboardSnapshot()
 	s.Version = 4

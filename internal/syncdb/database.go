@@ -27,9 +27,10 @@ type ExportOptions struct {
 }
 
 type ExportResult struct {
-	Snapshot             *Snapshot
-	RehomedLibraryPanels int
-	RenamedLibraryPanels int
+	Snapshot                        *Snapshot
+	RehomedLibraryPanels            int
+	RenamedLibraryPanels            int
+	OmittedOrphanLibraryConnections int
 }
 
 func Open(ctx context.Context, engine, dsn string) (*Database, error) {
@@ -178,6 +179,10 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 			s.RBAC.LegacyACL = append(s.RBAC.LegacyACL, row.RBACACL)
 		}
 		canonicalizeManagedRBAC(s.RBAC)
+		result.OmittedOrphanLibraryConnections, err = s.omitOrphanLibraryConnections()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if options.RehomeOrphanLibraryPanels {
 		result.RehomedLibraryPanels, result.RenamedLibraryPanels, err = s.rehomeOrphanLibraryPanelsWithOptions(options.RenameCollidingLibraryPanels)

@@ -70,9 +70,68 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard (id, org_id, uid, title, data, version, is_folder, folder_id, has_acl, is_public) VALUES (77, 77, 'other-board', 'Other board', '{}', 1, FALSE, 0, FALSE, FALSE)"); err != nil {
 			t.Fatal(err)
 		}
-		want, err := db.ExportTargets(ctx, AllTargets)
+		// Grafana's schema permits dangling connections; relax this fixture's extra FK.
+		constraintQuery := "SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'library_element_connection' AND COLUMN_NAME = 'connection_id' AND REFERENCED_TABLE_NAME = 'dashboard'"
+		drop := "DROP FOREIGN KEY "
+		if engine == "postgres" {
+			constraintQuery = "SELECT conname FROM pg_constraint WHERE conrelid = 'library_element_connection'::regclass AND confrelid = 'dashboard'::regclass AND contype = 'f'"
+			drop = "DROP CONSTRAINT "
+		}
+		var constraint string
+		if err := db.DB.QueryRowContext(ctx, constraintQuery).Scan(&constraint); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB.ExecContext(ctx, "ALTER TABLE library_element_connection "+drop+db.quote(constraint)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB.ExecContext(ctx, "DELETE FROM dashboard WHERE id BETWEEN 20 AND 25"); err != nil {
+			t.Fatal(err)
+		}
+		original := dashboardDatabaseState(t, ctx, db) + rbacState(t, ctx, db) + rbacSequenceState(t, ctx, db)
+		baseline, err := db.ExportWithOptions(ctx, AllTargets, ExportOptions{})
 		if err != nil {
 			t.Fatal(err)
+		}
+		want := baseline.Snapshot
+		if baseline.OmittedOrphanLibraryConnections != 6 || len(want.LibraryConnection.Rows) != 8 || original != dashboardDatabaseState(t, ctx, db)+rbacState(t, ctx, db)+rbacSequenceState(t, ctx, db) {
+			t.Fatal("export did not omit exactly six dangling connections without source changes")
+		}
+		for targets := Targets(1); targets <= AllTargets; targets++ {
+			expected, err := want.Select(targets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			if targets.Has(TargetDashboard) {
+				count = 6
+			}
+			result, err := db.ExportWithOptions(ctx, targets, ExportOptions{})
+			if err != nil || result.OmittedOrphanLibraryConnections != count || !reflect.DeepEqual(result.Snapshot, expected) {
+				t.Fatal("connection omission did not respect target selection", targets, err)
+			}
+		}
+		for _, tc := range []struct{ name, change, restore, diagnostic string }{
+			{"orphan unsupported kind", "kind = 2 WHERE id = 108", "kind = 1 WHERE id = 108", "unsupported kind"},
+			{"invalid dashboard ID", "connection_id = 0 WHERE id = 108", "connection_id = 20 WHERE id = 108", "missing dashboard"},
+			{"folder reference", "connection_id = 11 WHERE id = 100", "connection_id = 12 WHERE id = 100", "missing dashboard"},
+			{"other organization", "connection_id = 77 WHERE id = 100", "connection_id = 12 WHERE id = 100", "another organization"},
+			{"invalid connection ID", "id = -108 WHERE id = 108", "id = 108 WHERE id = -108", "invalid id"},
+		} {
+			t.Run(engine+"/reject_connection_"+tc.name, func(t *testing.T) {
+				if _, err := db.DB.ExecContext(ctx, "UPDATE library_element_connection SET "+tc.change); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if _, err := db.DB.ExecContext(ctx, "UPDATE library_element_connection SET "+tc.restore); err != nil {
+						t.Error(err)
+					}
+				})
+				before := dashboardDatabaseState(t, ctx, db) + rbacState(t, ctx, db) + rbacSequenceState(t, ctx, db)
+				result, err := db.ExportWithOptions(ctx, AllTargets, ExportOptions{})
+				if err == nil || result != nil || !strings.Contains(err.Error(), tc.diagnostic) || strings.Contains(err.Error(), "shared") || strings.Contains(err.Error(), "共有パネル") || before != dashboardDatabaseState(t, ctx, db)+rbacState(t, ctx, db)+rbacSequenceState(t, ctx, db) {
+					t.Fatal("export omitted an ambiguous connection, exposed values or changed the source", err)
+				}
+			})
 		}
 		for _, row := range want.LibraryElement.Rows {
 			row[columnIndex(want.LibraryElement.Columns, "folder_id")] = str("0")
@@ -89,7 +148,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 			t.Fatal("default export accepted missing library folders", err)
 		}
 		result, err := db.ExportWithOptions(ctx, AllTargets, ExportOptions{RehomeOrphanLibraryPanels: true})
-		if err != nil || result.RehomedLibraryPanels != 8 || !reflect.DeepEqual(result.Snapshot, want) {
+		if err != nil || result.RehomedLibraryPanels != 8 || result.OmittedOrphanLibraryConnections != 6 || !reflect.DeepEqual(result.Snapshot, want) {
 			t.Fatal("rehome did not preserve all other snapshot fields, references and RBAC", err)
 		}
 		if state() != before {
@@ -104,7 +163,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 				t.Fatal(err)
 			}
 			result, err := db.ExportWithOptions(ctx, targets, ExportOptions{RehomeOrphanLibraryPanels: true})
-			if err != nil || result.RehomedLibraryPanels != 8 || !reflect.DeepEqual(result.Snapshot, want) {
+			if err != nil || result.RehomedLibraryPanels != 8 || result.OmittedOrphanLibraryConnections != 6 || !reflect.DeepEqual(result.Snapshot, want) {
 				t.Fatal("rehome did not respect target selection", targets, err)
 			}
 		}
@@ -157,7 +216,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 				t.Fatal(err)
 			}
 			result, err := db.ExportWithOptions(ctx, targets, renameOptions)
-			if err != nil || result.RehomedLibraryPanels != 8 || result.RenamedLibraryPanels != 1 || !reflect.DeepEqual(result.Snapshot, expected) || state() != collisionBefore {
+			if err != nil || result.RehomedLibraryPanels != 8 || result.RenamedLibraryPanels != 1 || result.OmittedOrphanLibraryConnections != 6 || !reflect.DeepEqual(result.Snapshot, expected) || state() != collisionBefore {
 				t.Fatal("rename changed more than the colliding orphan name and folder columns", targets, err)
 			}
 		}
@@ -165,7 +224,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		cmd := exec.CommandContext(ctx, binary, "export", "-db", engine, "-file", renamePath, "--targets", AllTargets.String(), "--rehome-orphan-library-panels", "--rename-colliding-library-panels")
 		cmd.Env = append(os.Environ(), "GRAFANA_SYNC_DSN="+os.Getenv(strings.ToUpper(engine)+"_TEST_DSN"))
 		out, err := cmd.CombinedOutput()
-		if err != nil || !strings.Contains(string(out), "renamed 1 rehomed library panels") || !strings.Contains(string(out), "panel model unchanged") || strings.Contains(string(out), "共有パネル") || strings.Contains(string(out), "shared") {
+		if err != nil || !strings.Contains(string(out), "renamed 1 rehomed library panels") || !strings.Contains(string(out), "omitted 6 orphan library connections") || !strings.Contains(string(out), "panel model unchanged") || strings.Contains(string(out), "共有パネル") || strings.Contains(string(out), "shared") {
 			t.Fatal("CLI did not safely report the rename count", err)
 		}
 		renamedData, err := os.ReadFile(renamePath)
@@ -197,7 +256,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatal("failed CLI export created a file", err)
 		}
-		if out, err := runCLI(true); err != nil || !strings.Contains(out, "rehomed 8 orphan library panels to General") || !strings.Contains(out, "folder-inherited access may change") || strings.Contains(out, "shared") {
+		if out, err := runCLI(true); err != nil || !strings.Contains(out, "rehomed 8 orphan library panels to General") || !strings.Contains(out, "omitted 6 orphan library connections") || !strings.Contains(out, "folder-inherited access may change") || strings.Contains(out, "shared") {
 			t.Fatal("CLI omitted safe repair count or access warning", out, err)
 		}
 		data, err := os.ReadFile(path)
@@ -248,6 +307,19 @@ func TestOrphanLibraryFolders(t *testing.T) {
 					if err == nil || !strings.Contains(err.Error(), "missing folder") || before != dashboardDatabaseState(t, ctx, db)+rbacState(t, ctx, db)+rbacSequenceState(t, ctx, db) {
 						t.Fatal("import/sync silently repaired an orphan or changed the target", err)
 					}
+					invalid = cloneSnapshot(t, s)
+					invalid.LibraryConnection.Rows = append(invalid.LibraryConnection.Rows, []*string{str("200"), str("40"), str("1"), str("99999")})
+					if mode == ImportSync {
+						if _, err := db.Sync(ctx, invalid, SyncOptions{DryRun: true, PrincipalMap: mapping}); err == nil {
+							t.Fatal("dry-run accepted an orphan connection in input")
+						}
+						_, err = db.Sync(ctx, invalid, SyncOptions{AllowDelete: true, PrincipalMap: mapping})
+					} else {
+						_, err = db.ImportWithOptions(ctx, invalid, mode, ImportOptions{PrincipalMap: mapping})
+					}
+					if err == nil || !strings.Contains(err.Error(), "missing dashboard") || before != dashboardDatabaseState(t, ctx, db)+rbacState(t, ctx, db)+rbacSequenceState(t, ctx, db) {
+						t.Fatal("import/sync omitted an invalid input connection or changed the target", err)
+					}
 					if mode == ImportSync {
 						if _, err := db.Sync(ctx, s, SyncOptions{DryRun: true, PrincipalMap: mapping}); err != nil {
 							t.Fatal(err)
@@ -276,7 +348,7 @@ func TestOrphanLibraryFolders(t *testing.T) {
 					}
 					got, err := db.ExportTargets(ctx, AllTargets)
 					if err != nil || !reflect.DeepEqual(got, snapshot) {
-						t.Fatal("repaired panels, 14 connections or explicit permissions did not round trip", err)
+						t.Fatal("repaired panels, eight live connections or explicit permissions did not round trip", err)
 					}
 				})
 			}
