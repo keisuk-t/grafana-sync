@@ -4,8 +4,28 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 )
+
+func (s *Snapshot) rehomeOrphanLibraryPanels() (int, error) {
+	if err := requireColumns(s.LibraryElement, "library_element", "folder_id", "folder_uid"); err != nil {
+		return 0, err
+	}
+	dashboards := syncRowsByID(s.Dashboard, "id")
+	count := 0
+	for _, row := range s.LibraryElement.Rows {
+		id, err := strconv.ParseInt(cell(s.LibraryElement, row, "folder_id"), 10, 64)
+		if err != nil || id <= 0 || cell(s.LibraryElement, row, "folder_uid") != "" || dashboards[id] != nil {
+			continue
+		}
+		idValue, uidValue := "0", "general"
+		row[columnIndex(s.LibraryElement.Columns, "folder_id")] = &idValue
+		row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = &uidValue
+		count++
+	}
+	return count, nil
+}
 
 func libraryReferences(data string) ([]string, error) {
 	document, err := dashboardDocument(data)
@@ -69,9 +89,12 @@ func (s *Snapshot) validateLibraryState(scope map[int64]bool) error {
 			return errors.New("library_element has invalid folder_id")
 		}
 		if folder == "" || folder == "general" {
+			if id != 0 && folder == "" && dashboards[id] == nil {
+				return fmt.Errorf("library panel references a missing folder (panel ID %s, folder ID %d); export with --rehome-orphan-library-panels to explicitly move eligible orphans to General", cell(s.LibraryElement, row, "id"), id)
+			}
 			folder = "general"
 			if id != 0 {
-				return errors.New("root library panel has a folder_id")
+				return fmt.Errorf("root library panel has a folder_id (panel ID %s, folder ID %d)", cell(s.LibraryElement, row, "id"), id)
 			}
 		} else {
 			parent := folders[resourceKey(org, folder)]

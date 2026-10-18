@@ -90,6 +90,32 @@ func TestPrincipalMapFlag(t *testing.T) {
 	}
 }
 
+func TestRehomeOrphanLibraryPanelsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+		err := Run(context.Background(), []string{"export", "-db", "mysql", "-file", "missing.json", "--targets", targets.String(), "--rehome-orphan-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{})
+		want := "--rehome-orphan-library-panels requires --targets including dashboard"
+		if targets.Has(syncdb.TargetDashboard) {
+			want = "DSN environment variable is unset or empty"
+		}
+		if err == nil || err.Error() != want {
+			t.Fatal("unexpected flag validation", targets, err)
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--rehome-orphan-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatal("import accepted export-only repair option", err)
+	}
+	var help bytes.Buffer
+	if err := Run(context.Background(), []string{"export", "--help"}, &bytes.Buffer{}, &help); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"rehome-orphan-library-panels", "General", "access may change"} {
+		if !strings.Contains(help.String(), text) {
+			t.Fatal("help omits rehome restriction or risk", text)
+		}
+	}
+}
+
 func TestImportModeFlag(t *testing.T) {
 	t.Setenv("GRAFANA_SYNC_DSN", "")
 	for _, mode := range []string{"require-empty", "insert-only"} {

@@ -146,6 +146,7 @@ DB エラーに機密カラム値が含まれる場合があるため、生の�
 - `require-empty` は選択した6テーブル（version 3 入力では4テーブル）が空であることを要求します。対象UIDの既存権限も競合として拒否します。`insert-only` は既存 dashboard ID を優先し、その配下のタグ・履歴・パネル関連付け・権限を追記しません。既存 library element ID の定義や権限も更新しませんが、新規ダッシュボードから既存パネルへの整合する関連付けは追加できます。
 - `sync` は scope 内のフォルダ・ダッシュボード・タグ・履歴・ライブラリパネルと関連付け・標準権限を同期します。再作成、UID／名前の交換、フォルダ移動に対応し、対象外組織は保持します。
 - ライブラリパネルは ID／UID と model JSON を保持します。通常のパネル（`kind=1`）とダッシュボードへの関連付け（`kind=1`）のみ対応し、未知の種類・欠落した本体／ダッシュボード・組織をまたぐ関連付け・不整合なフォルダ参照は拒否します。本体・履歴 JSON の `libraryPanel.uid` を解決し、現行本体の参照には対応する関連付けも要求します。履歴からのみ参照するパネルも本体が必要です。
+- 保存先フォルダを失ったライブラリパネルも既定では拒否します。元 DB を変更せず General へ移す明示オプションと権限上の注意は、下記を参照してください。
 - 対象外ダッシュボードの関連付けは削除しません。対象外／不明な接続先があるパネル本体の更新・削除は事前エラーです。共有パネルを更新すると、同期対象内の全利用ダッシュボードへ変更が反映されます。
 - version 5はViewer／Editor／Admin等の標準ロールと個別ユーザー・チームのリソース権限を、組織・論理ロール・action・scopeで保存します。移行先のroleは名前と割当を検証して解決し、不足するmanaged roleはトランザクション内で作成します。元DB固有のrole／permission／assignment／ACL IDはコピーしません。
 - **公開共有設定は移行しませんが、共有設定のあるダッシュボード本体は export できます。** `dashboard_public` の公開URL・アクセストークン・有効／無効等は JSON に含めず、`dashboard.is_public` は出力内で `0` にします。移行元 DB の設定は変更しません。移行先に共有設定がなければ公開共有は作成されません。
@@ -154,6 +155,21 @@ DB エラーに機密カラム値が含まれる場合があるため、生の�
 - stars・playlist・annotations・alerts 等は移行しません。移行先で削除や ID／UID／組織変更がこれらの参照を壊す場合は事前エラーにします。
 - dashboard本体・履歴JSONおよびライブラリパネル model の静的な datasource UID／名前参照は、移行後のデータソース状態に対して確認します。`datasource` を選ばない場合は既存 DB を参照します。動的変数・プラグイン固有の外部参照は完全検査できず警告します。移行後に Grafana で表示とクエリを確認してください。
 - `created_by`／`updated_by`・保存履歴内の作成者IDは原値のままで、ユーザー自体は移行せず、IDも再マッピングしません。
+
+### フォルダ参照が欠落したライブラリパネルの明示的な救済
+
+`library panel references a missing folder`（旧版では `root library panel has a folder_id`）で停止し、保存先が欠落していることを管理者が確認した場合に限り、export 専用の `--rehome-orphan-library-panels` を指定できます。`--targets` に `dashboard` を含める必要があります。既定値は無効で、import には指定できません。
+
+```sh
+./bin/grafana-sync export -db mysql -file rescued.dump.json \
+  --targets org,datasource,dashboard --rehome-orphan-library-panels
+```
+
+救済するのは、`library_element.folder_uid` が NULL または空文字で、正の `folder_id` に対応する `dashboard` 行が全組織を通じて存在しないパネルだけです。出力 JSON 上でその2列のみを `folder_id=0`、`folder_uid=general` へ変更し、移動件数と警告を標準エラーへ表示します。元 DB は読み取り専用トランザクションで扱い、パネル本体・ID／UID・model・ダッシュボード本体／履歴・関連付け・明示的な RBAC 権限は変更しません。JSON は引き続き version 5 で、通常の import／sync で読み込めます。
+
+**General への配置変更は、フォルダから継承する閲覧・編集権限やライブラリパネルの一覧表示を変える可能性があります。明示的な RBAC を保持しても、移行前と同じ実効アクセス権を保証しません。** 適用前に dry-run、DB バックアップ、General のアクセス設定を確認し、適用後に Grafana で表示・操作・アクセス権を確認してください。
+
+救済対象外の不整合（実在する ID を指すのに UID が欠落、ID／UID の食い違い、空でない未解決 UID、`general` と正の ID の併存、不正な ID）や、移動後の General 内の名前衝突は推測で修復せず拒否します。正常なパネルや既存の General 配下のパネルは変更しません。import／sync の入力検証・対象外の共有参照保護も緩和しません。
 
 ## 権限の対応付け（version 5）
 

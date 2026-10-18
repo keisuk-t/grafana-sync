@@ -21,6 +21,15 @@ type Database struct {
 	Engine string
 }
 
+type ExportOptions struct {
+	RehomeOrphanLibraryPanels bool
+}
+
+type ExportResult struct {
+	Snapshot             *Snapshot
+	RehomedLibraryPanels int
+}
+
 func Open(ctx context.Context, engine, dsn string) (*Database, error) {
 	var db *sql.DB
 	switch engine {
@@ -100,8 +109,19 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 }
 
 func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapshot, error) {
+	result, err := d.ExportWithOptions(ctx, targets, ExportOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return result.Snapshot, nil
+}
+
+func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, options ExportOptions) (*ExportResult, error) {
 	if err := targets.Validate(); err != nil {
 		return nil, err
+	}
+	if options.RehomeOrphanLibraryPanels && !targets.Has(TargetDashboard) {
+		return nil, errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
 	}
 	if err := d.checkStorage(ctx, targets); err != nil {
 		return nil, err
@@ -112,6 +132,7 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 	}
 	defer tx.Rollback()
 	s := &Snapshot{Version: 5, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
+	result := &ExportResult{Snapshot: s}
 	org, err := d.readTable(ctx, tx, (&Snapshot{Version: 2}).entries()[0])
 	if err != nil {
 		return nil, err
@@ -153,13 +174,19 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		}
 		canonicalizeManagedRBAC(s.RBAC)
 	}
+	if options.RehomeOrphanLibraryPanels {
+		result.RehomedLibraryPanels, err = s.rehomeOrphanLibraryPanels()
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := s.Validate(); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, errors.New("cannot commit export transaction")
 	}
-	return s, nil
+	return result, nil
 }
 
 func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) (Table, error) {

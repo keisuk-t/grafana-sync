@@ -1,12 +1,96 @@
 package syncdb
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+func TestRehomeOrphanLibraryPanels(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		make func() *Snapshot
+	}{{"v4", librarySnapshot}, {"v5", rbacSnapshot}} {
+		for _, tc := range []struct {
+			name      string
+			id, uid   *string
+			rehome    bool
+			wantValid bool
+		}{
+			{"NULL UID orphan", str("404"), nil, true, true},
+			{"empty UID orphan", str("404"), str(""), true, true},
+			{"UID folder", str("0"), str("child"), false, true},
+			{"consistent folder", str("11"), str("child"), false, true},
+			{"root NULL", str("0"), nil, false, true},
+			{"root empty", str("0"), str(""), false, true},
+			{"root general", str("0"), str("general"), false, true},
+			{"existing folder ID", str("11"), nil, false, false},
+			{"existing dashboard ID", str("12"), nil, false, false},
+			{"conflicting general", str("404"), str("general"), false, false},
+			{"missing UID reference", str("404"), str("missing"), false, false},
+			{"existing UID with missing ID", str("404"), str("child"), false, false},
+			{"NULL ID", nil, nil, false, false},
+			{"negative ID", str("-1"), nil, false, false},
+			{"invalid ID", str("not-an-id"), nil, false, false},
+		} {
+			t.Run(version.name+"/"+tc.name, func(t *testing.T) {
+				s := version.make()
+				row := s.LibraryElement.Rows[0]
+				row[columnIndex(s.LibraryElement.Columns, "folder_id")] = tc.id
+				row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = tc.uid
+				want := version.make()
+				want.LibraryElement.Rows[0][columnIndex(want.LibraryElement.Columns, "folder_id")] = tc.id
+				want.LibraryElement.Rows[0][columnIndex(want.LibraryElement.Columns, "folder_uid")] = tc.uid
+				wantCount := 0
+				if tc.rehome {
+					if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "--rehome-orphan-library-panels") || strings.Contains(err.Error(), "shared") {
+						t.Fatal("orphan was not safely rejected by default", err)
+					}
+					wantCount = 1
+					want.LibraryElement.Rows[0][columnIndex(want.LibraryElement.Columns, "folder_id")] = str("0")
+					want.LibraryElement.Rows[0][columnIndex(want.LibraryElement.Columns, "folder_uid")] = str("general")
+				}
+				count, err := s.rehomeOrphanLibraryPanels()
+				if err != nil || count != wantCount || !reflect.DeepEqual(s, want) {
+					t.Fatal("rehome changed more than the orphan's folder fields", count, err)
+				}
+				if err := s.Validate(); (err == nil) != tc.wantValid {
+					t.Fatal("unexpected validation after rehome", err)
+				}
+				if count, err := s.rehomeOrphanLibraryPanels(); err != nil || count != 0 || !reflect.DeepEqual(s, want) {
+					t.Fatal("rehome is not idempotent", count, err)
+				}
+			})
+		}
+	}
+	db := &Database{}
+	if _, err := db.ExportWithOptions(context.Background(), DefaultTargets, ExportOptions{RehomeOrphanLibraryPanels: true}); err == nil || !strings.Contains(err.Error(), "requires --targets including dashboard") {
+		t.Fatal("rehome accepted without a dashboard target before connecting", err)
+	}
+}
+
+func TestRehomeOrphanLibraryPanelsRejectsNameCollision(t *testing.T) {
+	s := librarySnapshot()
+	row := s.LibraryElement.Rows[0]
+	row[columnIndex(s.LibraryElement.Columns, "folder_id")] = str("404")
+	row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = nil
+	other := append([]*string{}, row...)
+	other[columnIndex(s.LibraryElement.Columns, "id")] = str("41")
+	other[columnIndex(s.LibraryElement.Columns, "uid")] = str("other")
+	other[columnIndex(s.LibraryElement.Columns, "folder_id")] = str("0")
+	other[columnIndex(s.LibraryElement.Columns, "folder_uid")] = str("")
+	other[columnIndex(s.LibraryElement.Columns, "model")] = str(`{"uid":"other","type":"timeseries"}`)
+	s.LibraryElement.Rows = append(s.LibraryElement.Rows, other)
+	if count, err := s.rehomeOrphanLibraryPanels(); err != nil || count != 1 {
+		t.Fatal(count, err)
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate name") {
+		t.Fatal("rehome accepted a name collision in General", err)
+	}
+}
 
 func librarySnapshot() *Snapshot {
 	s := dashboardSnapshot()

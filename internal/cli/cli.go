@@ -21,6 +21,9 @@ Datasource includes data_keys and matching datasource secrets. Dashboard include
 legacy SQL folders, tags, versions and resource RBAC. Version 5 individual/team
 grants require --principal-map and pre-existing matching users and teams.
 Global/shared role differences and Unified Storage are not supported.
+Export --rehome-orphan-library-panels explicitly moves panels with a missing
+folder ID and NULL/empty folder UID to General in the JSON only. This can change
+folder-inherited access. Without this flag, missing folders are rejected.
 Import defaults to --mode require-empty. Use --mode insert-only to add missing
 primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
@@ -48,7 +51,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
 	principalMapFile := ""
-	var dryRun, allowDelete bool
+	var dryRun, allowDelete, rehomeOrphanLibraryPanels bool
+	if command == "export" {
+		flags.BoolVar(&rehomeOrphanLibraryPanels, "rehome-orphan-library-panels", false, "move panels with a missing folder ID and NULL/empty folder UID to General in export JSON only; folder-inherited access may change (requires dashboard target)")
+	}
 	if command == "import" {
 		flags.StringVar(&principalMapFile, "principal-map", "", "explicit user/team identity mapping JSON (version 1)")
 		flags.StringVar(&modeName, "mode", modeName, "import mode: require-empty, insert-only or sync")
@@ -71,6 +77,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if err := mode.Validate(); err != nil {
 		return err
+	}
+	if rehomeOrphanLibraryPanels && !targets.Has(syncdb.TargetDashboard) {
+		return errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
 	}
 	if command == "import" {
 		if mode != syncdb.ImportSync && (dryRun || allowDelete) {
@@ -156,9 +165,15 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
 		return err
 	} else {
-		snapshot, err = db.ExportTargets(ctx, targets)
+		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels})
 		if err != nil {
 			return err
+		}
+		snapshot = result.Snapshot
+		if result.RehomedLibraryPanels > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: rehomed %d orphan library panels to General in export JSON only; source database unchanged; folder-inherited access may change\n", result.RehomedLibraryPanels); err != nil {
+				return err
+			}
 		}
 		if err := writeSnapshot(*file, snapshot); err != nil {
 			return err
