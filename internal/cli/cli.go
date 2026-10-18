@@ -21,6 +21,10 @@ Datasource includes data_keys and matching datasource secrets. Dashboard include
 legacy SQL folders, tags, versions and resource RBAC. Version 5 individual/team
 grants require --principal-map and pre-existing matching users and teams.
 Global/shared role differences and Unified Storage are not supported.
+Export --exclude-library-panel-dashboards omits dashboards with library-panel
+references in current JSON, history or connections, and all library panels and
+connections. Filtered snapshots cannot be used for dashboard sync. Cannot be
+combined with library rehome or rename options. Source data is unchanged.
 Export --rehome-orphan-library-panels explicitly moves panels with a missing
 folder ID and NULL/empty folder UID to General in the JSON only. This can change
 folder-inherited access. Without this flag, missing folders are rejected.
@@ -53,8 +57,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
 	principalMapFile := ""
-	var dryRun, allowDelete, rehomeOrphanLibraryPanels, renameCollidingLibraryPanels bool
+	var dryRun, allowDelete, rehomeOrphanLibraryPanels, renameCollidingLibraryPanels, excludeLibraryPanelDashboards bool
 	if command == "export" {
+		flags.BoolVar(&excludeLibraryPanelDashboards, "exclude-library-panel-dashboards", false, "exclude dashboards using library panels in current JSON, history or connections, and all library panels; filtered dashboard snapshots cannot be synced")
 		flags.BoolVar(&rehomeOrphanLibraryPanels, "rehome-orphan-library-panels", false, "move panels with a missing folder ID and NULL/empty folder UID to General in export JSON only; folder-inherited access may change (requires dashboard target)")
 		flags.BoolVar(&renameCollidingLibraryPanels, "rename-colliding-library-panels", false, "rename only rehomed library panels with a name collision in General in export JSON only (requires --rehome-orphan-library-panels)")
 	}
@@ -83,6 +88,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if rehomeOrphanLibraryPanels && !targets.Has(syncdb.TargetDashboard) {
 		return errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
+	}
+	if excludeLibraryPanelDashboards && (!targets.Has(syncdb.TargetDashboard) || rehomeOrphanLibraryPanels || renameCollidingLibraryPanels) {
+		return errors.New("--exclude-library-panel-dashboards requires dashboard target and cannot be combined with library rehome or rename options")
 	}
 	if renameCollidingLibraryPanels && !rehomeOrphanLibraryPanels {
 		return errors.New("--rename-colliding-library-panels requires --rehome-orphan-library-panels")
@@ -114,6 +122,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		snapshot, err = snapshot.Select(targets)
 		if err != nil {
 			return err
+		}
+		if snapshot.LibraryPanelsExcluded && mode == syncdb.ImportSync {
+			return errors.New("dashboard sync is not allowed for snapshots with library_panels_excluded; use require-empty or insert-only")
 		}
 		if principalMapFile != "" {
 			input, err := os.Open(principalMapFile)
@@ -171,11 +182,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
 		return err
 	} else {
-		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels, RenameCollidingLibraryPanels: renameCollidingLibraryPanels})
+		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels, RenameCollidingLibraryPanels: renameCollidingLibraryPanels, ExcludeLibraryPanelDashboards: excludeLibraryPanelDashboards})
 		if err != nil {
 			return err
 		}
 		snapshot = result.Snapshot
+		if snapshot.LibraryPanelsExcluded {
+			if _, err := fmt.Fprintf(stderr, "warning: excluded library-panel dashboards=%d history=%d tags=%d library_panels=%d connections=%d from export only; source database unchanged; dashboard sync disabled for this snapshot\n", result.ExcludedLibraryDashboards, result.ExcludedLibraryHistory, result.ExcludedLibraryTags, result.ExcludedLibraryPanels, result.ExcludedLibraryConnections); err != nil {
+				return err
+			}
+		}
 		if result.OmittedOrphanLibraryConnections > 0 {
 			if _, err := fmt.Fprintf(stderr, "warning: omitted %d orphan library connections from export JSON only because their dashboards do not exist; source database unchanged\n", result.OmittedOrphanLibraryConnections); err != nil {
 				return err

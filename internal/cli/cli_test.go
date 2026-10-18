@@ -72,6 +72,24 @@ func TestImportValidatesBeforeConnecting(t *testing.T) {
 	}
 }
 
+func TestLibraryExclusionFlagValidation(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	for _, options := range [][]string{
+		{},
+		{"--targets", "dashboard", "--rehome-orphan-library-panels"},
+		{"--targets", "dashboard", "--rename-colliding-library-panels"},
+	} {
+		args := append([]string{"export", "-db", "mysql", "-file", "unused", "--exclude-library-panel-dashboards"}, options...)
+		err := Run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "--exclude-library-panel-dashboards requires") {
+			t.Fatal("invalid exclusion options reached the database", err)
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--exclude-library-panel-dashboards"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("export-only exclusion flag accepted on import")
+	}
+}
+
 func TestPrincipalMapFlag(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.json")
 	if err := os.WriteFile(path, []byte(`{"version":5,"targets":["org"],"scope":{"org_ids":[]},"tables":{"org":{"columns":["id","name"],"rows":[]}}}`), 0o600); err != nil {

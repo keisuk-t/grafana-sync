@@ -21,22 +21,23 @@ type Table struct {
 }
 
 type Snapshot struct {
-	Version              int                   `json:"version"`
-	Org                  Table                 `json:"org"`
-	DataSource           Table                 `json:"data_source"`
-	DataKeys             Table                 `json:"data_keys"`
-	Secrets              Table                 `json:"secrets"`
-	Dashboard            Table                 `json:"-"`
-	Folder               Table                 `json:"-"`
-	DashboardTag         Table                 `json:"-"`
-	DashboardVersion     Table                 `json:"-"`
-	LibraryElement       Table                 `json:"-"`
-	LibraryConnection    Table                 `json:"-"`
-	Targets              []string              `json:"-"`
-	Scope                Scope                 `json:"-"`
-	DashboardPermissions []DashboardPermission `json:"-"`
-	RBAC                 *ResourceRBAC         `json:"-"`
-	principalMap         *PrincipalMap
+	LibraryPanelsExcluded bool                  `json:"-"`
+	Version               int                   `json:"version"`
+	Org                   Table                 `json:"org"`
+	DataSource            Table                 `json:"data_source"`
+	DataKeys              Table                 `json:"data_keys"`
+	Secrets               Table                 `json:"secrets"`
+	Dashboard             Table                 `json:"-"`
+	Folder                Table                 `json:"-"`
+	DashboardTag          Table                 `json:"-"`
+	DashboardVersion      Table                 `json:"-"`
+	LibraryElement        Table                 `json:"-"`
+	LibraryConnection     Table                 `json:"-"`
+	Targets               []string              `json:"-"`
+	Scope                 Scope                 `json:"-"`
+	DashboardPermissions  []DashboardPermission `json:"-"`
+	RBAC                  *ResourceRBAC         `json:"-"`
+	principalMap          *PrincipalMap
 }
 
 type Scope struct {
@@ -98,13 +99,14 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		tables[entry.name] = *entry.table
 	}
 	return json.Marshal(struct {
-		Version              int                    `json:"version"`
-		Targets              []string               `json:"targets"`
-		Scope                Scope                  `json:"scope"`
-		Tables               map[string]Table       `json:"tables"`
-		DashboardPermissions *[]DashboardPermission `json:"dashboard_permissions,omitempty"`
-		RBAC                 *ResourceRBAC          `json:"rbac,omitempty"`
-	}{s.Version, s.Targets, s.Scope, tables, s.permissionEnvelope(), s.RBAC})
+		LibraryPanelsExcluded bool                   `json:"library_panels_excluded,omitempty"`
+		Version               int                    `json:"version"`
+		Targets               []string               `json:"targets"`
+		Scope                 Scope                  `json:"scope"`
+		Tables                map[string]Table       `json:"tables"`
+		DashboardPermissions  *[]DashboardPermission `json:"dashboard_permissions,omitempty"`
+		RBAC                  *ResourceRBAC          `json:"rbac,omitempty"`
+	}{s.LibraryPanelsExcluded, s.Version, s.Targets, s.Scope, tables, s.permissionEnvelope(), s.RBAC})
 }
 
 func (s *Snapshot) UnmarshalJSON(data []byte) error {
@@ -112,16 +114,17 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var wire struct {
-		Version              int                    `json:"version"`
-		Targets              []string               `json:"targets"`
-		Scope                *Scope                 `json:"scope"`
-		Tables               map[string]Table       `json:"tables"`
-		Org                  *Table                 `json:"org"`
-		DataSource           *Table                 `json:"data_source"`
-		DataKeys             *Table                 `json:"data_keys"`
-		Secrets              *Table                 `json:"secrets"`
-		DashboardPermissions *[]DashboardPermission `json:"dashboard_permissions"`
-		RBAC                 *ResourceRBAC          `json:"rbac"`
+		LibraryPanelsExcluded bool                   `json:"library_panels_excluded"`
+		Version               int                    `json:"version"`
+		Targets               []string               `json:"targets"`
+		Scope                 *Scope                 `json:"scope"`
+		Tables                map[string]Table       `json:"tables"`
+		Org                   *Table                 `json:"org"`
+		DataSource            *Table                 `json:"data_source"`
+		DataKeys              *Table                 `json:"data_keys"`
+		Secrets               *Table                 `json:"secrets"`
+		DashboardPermissions  *[]DashboardPermission `json:"dashboard_permissions"`
+		RBAC                  *ResourceRBAC          `json:"rbac"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -133,6 +136,12 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		return errors.New("invalid snapshot fields")
 	}
 	*s = Snapshot{Version: wire.Version}
+	if _, ok := fields["library_panels_excluded"]; ok {
+		if wire.Version != 5 || bytes.Equal(bytes.TrimSpace(fields["library_panels_excluded"]), []byte("null")) {
+			return errors.New("library_panels_excluded requires a version 5 boolean")
+		}
+		s.LibraryPanelsExcluded = wire.LibraryPanelsExcluded
+	}
 	if wire.Version == 2 {
 		for _, name := range []string{"targets", "scope", "tables", "dashboard_permissions", "rbac"} {
 			if _, ok := fields[name]; ok {
@@ -255,6 +264,9 @@ func (s *Snapshot) Validate() error {
 	}
 	if err := s.Selection().Validate(); err != nil {
 		return err
+	}
+	if s.LibraryPanelsExcluded && (s.Version != 5 || !s.Selection().Has(TargetDashboard) || len(s.LibraryElement.Rows) != 0 || len(s.LibraryConnection.Rows) != 0) {
+		return errors.New("library_panels_excluded requires a version 5 dashboard target with empty library tables")
 	}
 	if s.Version >= 3 && len(s.Targets) != len(s.Selection().Names()) {
 		return errors.New("targets must list individual resource names")

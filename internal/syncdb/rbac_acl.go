@@ -142,6 +142,10 @@ func aclActions(kind string, level int64, annotations bool) map[string]bool {
 }
 
 func (d *Database) readLegacyACL(ctx context.Context, tx *sql.Tx, dashboards Table, orgs []string, r *ResourceRBAC, all bool) ([]legacyACLRow, error) {
+	return d.readLegacyACLWithExclusions(ctx, tx, dashboards, orgs, r, all, nil)
+}
+
+func (d *Database) readLegacyACLWithExclusions(ctx context.Context, tx *sql.Tx, dashboards Table, orgs []string, r *ResourceRBAC, all bool, excluded map[string]bool) ([]legacyACLRow, error) {
 	result := []legacyACLRow{}
 	exists, err := d.tableExists(ctx, tx, "dashboard_acl")
 	if err != nil || !exists {
@@ -185,6 +189,9 @@ func (d *Database) readLegacyACL(ctx context.Context, tx *sql.Tx, dashboards Tab
 			if rows.Scan(&a.ID, &a.OrgID, &dashboard, &user, &team, &role, &a.Permission) != nil {
 				rows.Close()
 				return nil, errors.New("cannot decode legacy dashboard ACL")
+			}
+			if excluded[dashboard] {
+				continue
 			}
 			parent := byID[dashboard]
 			if parent == nil || a.OrgID != cell(dashboards, parent, "org_id") {

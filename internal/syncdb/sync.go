@@ -33,6 +33,9 @@ type syncTablePlan struct {
 }
 
 func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (ImportResult, error) {
+	if s != nil && s.LibraryPanelsExcluded && s.Selection().Has(TargetDashboard) {
+		return ImportResult{}, errors.New("dashboard sync is not allowed for snapshots with library_panels_excluded; use require-empty or insert-only")
+	}
 	if s != nil {
 		copy := *s
 		copy.principalMap = options.PrincipalMap

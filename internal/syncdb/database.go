@@ -22,11 +22,17 @@ type Database struct {
 }
 
 type ExportOptions struct {
-	RehomeOrphanLibraryPanels    bool
-	RenameCollidingLibraryPanels bool
+	ExcludeLibraryPanelDashboards bool
+	RehomeOrphanLibraryPanels     bool
+	RenameCollidingLibraryPanels  bool
 }
 
 type ExportResult struct {
+	ExcludedLibraryDashboards       int
+	ExcludedLibraryPanels           int
+	ExcludedLibraryConnections      int
+	ExcludedLibraryHistory          int
+	ExcludedLibraryTags             int
 	Snapshot                        *Snapshot
 	RehomedLibraryPanels            int
 	RenamedLibraryPanels            int
@@ -123,6 +129,14 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 	if err := targets.Validate(); err != nil {
 		return nil, err
 	}
+	if options.ExcludeLibraryPanelDashboards {
+		if !targets.Has(TargetDashboard) {
+			return nil, errors.New("--exclude-library-panel-dashboards requires --targets including dashboard")
+		}
+		if options.RehomeOrphanLibraryPanels || options.RenameCollidingLibraryPanels {
+			return nil, errors.New("--exclude-library-panel-dashboards cannot be combined with library rehome or rename options")
+		}
+	}
 	if options.RehomeOrphanLibraryPanels && !targets.Has(TargetDashboard) {
 		return nil, errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
 	}
@@ -153,6 +167,18 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 		}
 	}
 	if targets.Has(TargetDashboard) {
+		var excluded map[string]bool
+		if options.ExcludeLibraryPanelDashboards {
+			beforeDashboards, beforeHistory, beforeTags := len(s.Dashboard.Rows), len(s.DashboardVersion.Rows), len(s.DashboardTag.Rows)
+			result.ExcludedLibraryPanels, result.ExcludedLibraryConnections = len(s.LibraryElement.Rows), len(s.LibraryConnection.Rows)
+			excluded, err = s.excludeLibraryPanelDashboards()
+			if err != nil {
+				return nil, err
+			}
+			result.ExcludedLibraryDashboards = beforeDashboards - len(s.Dashboard.Rows)
+			result.ExcludedLibraryHistory = beforeHistory - len(s.DashboardVersion.Rows)
+			result.ExcludedLibraryTags = beforeTags - len(s.DashboardTag.Rows)
+		}
 		if public := columnIndex(s.Dashboard.Columns, "is_public"); public >= 0 {
 			for _, row := range s.Dashboard.Rows {
 				if cell(s.Dashboard, row, "is_public") == "1" {
@@ -171,7 +197,7 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 		if err != nil {
 			return nil, err
 		}
-		aclRows, err := d.readLegacyACL(ctx, tx, s.Dashboard, s.ScopeIDs(), s.RBAC, true)
+		aclRows, err := d.readLegacyACLWithExclusions(ctx, tx, s.Dashboard, s.ScopeIDs(), s.RBAC, true, excluded)
 		if err != nil {
 			return nil, err
 		}

@@ -111,6 +111,7 @@ func (s *Snapshot) Select(targets Targets) (*Snapshot, error) {
 	}
 	selected.Scope = Scope{OrgIDs: append([]string{}, s.ScopeIDs()...)}
 	if !targets.Has(TargetDashboard) {
+		selected.LibraryPanelsExcluded = false
 		selected.DashboardPermissions = nil
 		selected.RBAC = nil
 	}
