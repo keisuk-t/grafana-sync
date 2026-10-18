@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/keisuk-t/grafana-sync/internal/syncdb"
@@ -15,13 +16,16 @@ import (
 
 const usage = `Usage: grafana-sync <export|import> -db <mysql|postgres> -file <snapshot.json> [options]
 
-Transfers org, data_source, all data_keys and matching datasource secrets.
+Transfers --targets org,datasource,dashboard (default: org,datasource).
+Datasource includes data_keys and matching datasource secrets. Dashboard includes
+legacy SQL folders, tags, versions and Viewer/Editor resource permissions.
+Individual/team permissions and Unified Storage are not supported.
 Import defaults to --mode require-empty. Use --mode insert-only to add missing
 primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
 Use --mode sync --dry-run to inspect changes in the JSON's organizations, then
---mode sync --allow-delete to apply. Missing data sources and datasource secrets
-in those organizations are deleted. Other organizations and shared keys remain.
+--mode sync --allow-delete to apply. Selected resources missing from the JSON
+are deleted only in scope.org_ids. Unselected groups and shared keys remain.
 Stop Grafana and back up the target before importing. Dumps contain secrets.
 `
 
@@ -40,6 +44,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	file := flags.String("file", "", "snapshot path (export refuses to overwrite)")
 	dsnEnv := flags.String("dsn-env", "GRAFANA_SYNC_DSN", "environment variable containing the database DSN")
 	timeout := flags.Duration("timeout", 2*time.Minute, "database operation timeout")
+	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
 	var dryRun, allowDelete bool
 	if command == "import" {
@@ -57,6 +62,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return errors.New("require -db mysql|postgres, -file and a positive -timeout; positional arguments are not supported")
 	}
 	mode := syncdb.ImportMode(modeName)
+	targets, err := syncdb.ParseTargets(*targetNames)
+	if err != nil {
+		return err
+	}
 	if err := mode.Validate(); err != nil {
 		return err
 	}
@@ -83,6 +92,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		snapshot, err = snapshot.Select(targets)
+		if err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
@@ -101,6 +114,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if err := printSelection(stdout, snapshot); err != nil {
+			return err
+		}
 		if mode == syncdb.ImportSync {
 			state := "completed"
 			if dryRun {
@@ -112,7 +128,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			for _, entry := range []struct {
 				name  string
 				count syncdb.TableResult
-			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}} {
+			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}} {
+				if !tableSelected(entry.name, targets) {
+					continue
+				}
 				if _, err := fmt.Fprintf(stdout, "%s: inserted=%d updated=%d deleted=%d unchanged=%d skipped=%d\n", entry.name, entry.count.Inserted, entry.count.Updated, entry.count.Deleted, entry.count.Unchanged, entry.count.Skipped); err != nil {
 					return err
 				}
@@ -122,15 +141,37 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
 		return err
 	} else {
-		snapshot, err = db.Export(ctx)
+		snapshot, err = db.ExportTargets(ctx, targets)
 		if err != nil {
 			return err
 		}
 		if err := writeSnapshot(*file, snapshot); err != nil {
 			return err
 		}
+		if err := printSelection(stdout, snapshot); err != nil {
+			return err
+		}
 	}
-	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows))
+	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d dashboard=%d folder=%d dashboard_tag=%d dashboard_version=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows), len(snapshot.Dashboard.Rows), len(snapshot.Folder.Rows), len(snapshot.DashboardTag.Rows), len(snapshot.DashboardVersion.Rows))
+	return err
+}
+
+func tableSelected(name string, targets syncdb.Targets) bool {
+	switch name {
+	case "org":
+		return targets.Has(syncdb.TargetOrg)
+	case "data_source", "data_keys", "secrets":
+		return targets.Has(syncdb.TargetDatasource)
+	default:
+		return targets.Has(syncdb.TargetDashboard)
+	}
+}
+
+func printSelection(out io.Writer, s *syncdb.Snapshot) error {
+	_, err := fmt.Fprintf(out, "targets=%s scope.org_ids=%s\n", s.Selection(), strings.Join(s.ScopeIDs(), ","))
+	if err == nil && s.Selection().Has(syncdb.TargetDashboard) {
+		_, err = fmt.Fprintln(out, "dashboard tables: dashboard,folder,dashboard_tag,dashboard_version; includes Viewer/Editor permissions; warning: dynamic and plugin-specific external references cannot be fully checked")
+	}
 	return err
 }
 

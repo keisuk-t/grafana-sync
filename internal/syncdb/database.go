@@ -66,11 +66,11 @@ func (d *Database) quote(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-func (d *Database) checkStorage(ctx context.Context) error {
+func (d *Database) checkStorage(ctx context.Context, targets Targets) error {
 	if d.Engine != "mysql" {
 		return nil
 	}
-	for _, entry := range (&Snapshot{}).entries() {
+	for _, entry := range (&Snapshot{Version: 3, Targets: targets.Names()}).entries() {
 		name := entry.name
 		var engine string
 		if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil {
@@ -80,11 +80,26 @@ func (d *Database) checkStorage(ctx context.Context) error {
 			return fmt.Errorf("%s must use InnoDB for transactional transfer", name)
 		}
 	}
+	if targets.Has(TargetDashboard) {
+		for _, name := range []string{"role", "builtin_role", "permission"} {
+			var engine string
+			if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil || !strings.EqualFold(engine, "InnoDB") {
+				return fmt.Errorf("%s must exist and use InnoDB for transactional dashboard permissions", name)
+			}
+		}
+	}
 	return nil
 }
 
 func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
-	if err := d.checkStorage(ctx); err != nil {
+	return d.ExportTargets(ctx, DefaultTargets)
+}
+
+func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapshot, error) {
+	if err := targets.Validate(); err != nil {
+		return nil, err
+	}
+	if err := d.checkStorage(ctx, targets); err != nil {
 		return nil, err
 	}
 	tx, err := d.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
@@ -92,9 +107,28 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 		return nil, errors.New("cannot begin export transaction")
 	}
 	defer tx.Rollback()
-	s := &Snapshot{Version: 2}
+	s := &Snapshot{Version: 3, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
+	org, err := d.readTable(ctx, tx, (&Snapshot{Version: 2}).entries()[0])
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range org.Rows {
+		s.Scope.OrgIDs = append(s.Scope.OrgIDs, cell(org, row, "id"))
+	}
 	for _, entry := range s.entries() {
 		*entry.table, err = d.readTable(ctx, tx, entry)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if targets.Has(TargetDashboard) {
+		if err := d.checkDashboardStorage(ctx, tx); err != nil {
+			return nil, err
+		}
+		if err := d.guardDashboardDependencies(ctx, tx, s.Dashboard, false); err != nil {
+			return nil, err
+		}
+		s.DashboardPermissions, err = d.readDashboardPermissions(ctx, tx, s.Dashboard)
 		if err != nil {
 			return nil, err
 		}
@@ -116,6 +150,9 @@ func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) 
 			SELECT 1 FROM %[2]s
 			WHERE %[2]s.%[3]s = %[4]s.%[3]s AND %[2]s.%[5]s = %[4]s.%[6]s
 		)`, d.quote("type"), d.quote("data_source"), d.quote("org_id"), d.quote("secrets"), d.quote("name"), d.quote("namespace"))
+	}
+	if name == "dashboard_tag" || name == "dashboard_version" {
+		query += " WHERE EXISTS (SELECT 1 FROM " + d.quote("dashboard") + " WHERE " + d.quote("dashboard") + "." + d.quote("id") + " = " + d.quote(name) + "." + d.quote("dashboard_id") + ")"
 	}
 	rows, err := tx.QueryContext(ctx, query+" ORDER BY "+d.quote(entry.key))
 	if err != nil {

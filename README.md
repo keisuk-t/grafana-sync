@@ -1,6 +1,6 @@
 # grafana-sync
 
-Grafana の `org`・`data_source` と、データソースの暗号化情報に必要な `data_keys`・`secrets` を JSON にエクスポートし、別のデータベースへインポートする Go 製 CLI です。MySQL／PostgreSQL に対応します。ダッシュボード・ユーザー・アラート・その他のテーブルは移行しません。
+Grafana の組織・データソース・ダッシュボードを JSON にエクスポートし、別のデータベースへインポートする Go 製 CLI です。MySQL／PostgreSQL に対応します。対象は `--targets org,datasource,dashboard` の組み合わせで指定します。**既定値は `org,datasource`** で、ダッシュボードは明示的に選択した場合のみ処理します。ユーザー・チーム・アラート本体は移行しません。
 
 | テーブル | 移行する行 |
 | --- | --- |
@@ -8,8 +8,24 @@ Grafana の `org`・`data_source` と、データソースの暗号化情報に�
 | `data_source` | 全件 |
 | `data_keys` | 全件（無効化済みの鍵も含む） |
 | `secrets` | `type = 'datasource'` かつ `org_id`・`namespace` が移行するデータソースの `org_id`・`name` に一致する行のみ |
+| `dashboard` | `dashboard` 対象選択時のみ。通常のダッシュボードと `is_folder=1` のフォルダ行 |
+| `folder` | `dashboard` 対象選択時のみ。ルート／ネストフォルダの階層情報 |
+| `dashboard_tag`・`dashboard_version` | `dashboard` 対象選択時のみ。対象ダッシュボードのタグと保存履歴（孤立行は除外） |
+| 標準ロールのリソース権限 | `dashboard` 対象選択時のみ。Viewer／Editor のダッシュボード・フォルダ固有権限を正規化して保存 |
 
 `data_keys` は複数の用途で共有されるため、暗号文を解析せず、古い鍵も含めて保持します。`secrets` の別用途の行や孤立した行はエクスポートしません。
+
+### 対象の選択
+
+`org` は組織、`datasource` は `data_source`・`data_keys`・対象データソース用 `secrets`、`dashboard` は上表のダッシュボード関連データを一体で扱います。全7通りの非空の組み合わせに対応し、指定順序は問いません。未知名・重複・空要素はエラーです。公開名は `datasource` で、`data_source` は指定できません。
+
+```sh
+./bin/grafana-sync export -db mysql -file all.dump.json --targets org,datasource,dashboard
+./bin/grafana-sync import -db postgres -file all.dump.json --targets dashboard --mode sync --dry-run
+./bin/grafana-sync import -db postgres -file all.dump.json --targets dashboard --mode sync --allow-delete
+```
+
+import も同じ既定値なので、JSON に dashboard が含まれていても既定では処理しません。要求したグループが JSON にない場合はエラーです。未選択グループへの DML・採番変更は行いません。整合性確認のため、組織や参照するデータソース等を読み取る場合はあります。`org` を選ばない場合は、`scope.org_ids` の組織が移行先に存在する必要があります。
 
 ## セットアップ
 
@@ -52,8 +68,8 @@ export TARGET_DSN='postgres://grafana:password@target.example:5432/grafana?sslmo
 ```
 
 - **事前に Grafana と他の DB 書き込みクライアントを停止し、移行先 DB 全体をバックアップしてください。** [Grafana のバックアップ手順](https://grafana.com/docs/grafana/latest/administration/back-up-grafana/)を参照してください。
-- 移行先は Grafana のマイグレーションを実行済みで、4 対象テーブルのカラム名とバイナリカラムが移行元と一致する必要があります。DDL・スキーママイグレーションは実行しません。同一 Grafana バージョンのスキーマを推奨します。`data_keys.name` が文字列の主キー、`encrypted_data` が BLOB／BYTEA である Grafana の SQL スキーマを対象とします。関連テーブルがない旧スキーマや外部の secrets ストアは対象外です。
-- **既定の `--mode require-empty` では、移行先の `org`・`data_source`・`data_keys`・`secrets` がすべて空でなければなりません。** `secrets` に別用途の行しかない場合も拒否します。Grafana の通常の初回起動では既定の `org` が作成されるため、そのままではこのモードでインポートできません。既存 DB への非破壊的な追加には後述の `insert-only`、データソースの削除を含む同期には `sync` を使用してください。
+- 移行先は Grafana のマイグレーションを実行済みで、選択対象テーブルのカラム名とバイナリカラムが移行元と一致する必要があります。DDL・スキーママイグレーションは実行しません。同一 Grafana バージョンのスキーマを推奨します。`data_keys.name` が文字列の主キー、`encrypted_data` が BLOB／BYTEA である Grafana の SQL スキーマを対象とします。関連テーブルがない旧スキーマや外部の secrets ストアは対象外です。
+- **既定の `--mode require-empty` では、移行先の選択対象テーブルがすべて空でなければなりません。** 既定対象では `org`・`data_source`・`data_keys`・`secrets` の4テーブルです。`secrets` に別用途の行しかない場合も拒否します。Grafana の通常の初回起動では既定の `org` が作成されるため、そのままではこのモードで組織をインポートできません。既存 DB への非破壊的な追加には `insert-only`、削除を含む同期には `sync` を使用してください。
 - ID を保持して `org` → `data_keys` → `data_source` → `secrets` の順に挿入します。数値 ID・鍵名の重複、対応する組織がない `org_id`、移行するデータソースに対応しない `secrets` の行を拒否します。
 - 全対象テーブルを 1 トランザクションで処理し、失敗時は行の変更をロールバックします。MySQL はすべての対象テーブルが InnoDB であることを確認します。
 - PostgreSQL の関連 ID シーケンスはトランザクション内の `ALTER SEQUENCE ... RESTART` で更新します（シーケンス所有権が必要）。MySQL の `AUTO_INCREMENT` は明示 ID の挿入によって進みます。MySQL の採番カウンターはロールバック後も進む場合があります。
@@ -73,12 +89,12 @@ export TARGET_DSN='postgres://grafana:password@target.example:5432/grafana?sslmo
 - 同じ主キーが存在すれば、他フィールドの内容が異なっても行全体をスキップします。ID の再採番・組織へのマッピング変更・フィールド単位のマージもしません。
 - 別 ID で同じデータソース名を使う場合など、主キー以外の一意制約に衝突すると失敗し、今回の追加行をすべてロールバックします。`INSERT IGNORE` や更新付き upsert は使用しません。
 - 新しく追加する秘密情報の組織・データソース参照は移行先でも確認します。既存 ID の行に別の組織・名前が保存されていて参照が成立しない場合は、既存行を更新する代わりに失敗します。
-- 同じスナップショットを再実行しても、追加済みの主キーはスキップします。`inserted`／`skipped` は4テーブルを合計した行数です。追加のないテーブルの PostgreSQL シーケンスは変更せず、追加がある場合も既存の採番位置を巻き戻しません。
-- 入力には引き続き参照整合性を満たす version 2 のスナップショットを使用します。DB の既存行を参照するためだけに親行を入力から省略する形式には対応しません。
+- 同じスナップショットを再実行しても、追加済みの主キーはスキップします。`inserted`／`skipped` は選択対象の行と標準権限を合計した件数です。追加のないテーブルの PostgreSQL シーケンスは変更せず、追加がある場合も既存の採番位置を巻き戻しません。
+- 入力には参照整合性を満たす version 3 または version 2 のスナップショットを使用します。version 3 は org グループを省略して移行先の組織を参照できますが、選択したグループ内の親子関係は完結している必要があります。
 
 **同じ ID が同じ論理リソースを指す、互換性のある DB 間で使用してください。** 名前・暗号鍵・秘密情報が異なる既存行も優先されるため、追加した設定が元と同じ動作になる保証はありません。特に同じ `data_keys.name` に異なる暗号鍵が保存されている場合、既存鍵を変更しないため新しい暗号文を復号できないことがあります。事前のバックアップ・書き込み停止と、移行後の動作確認が必要です。
 
-### データソースの同期（sync）
+### 選択対象の同期（sync）
 
 ```sh
 ./bin/grafana-sync import -db postgres -dsn-env TARGET_DSN -file grafana.dump.json --mode sync --dry-run
@@ -87,7 +103,7 @@ export TARGET_DSN='postgres://grafana:password@target.example:5432/grafana?sslmo
 
 `sync` は明示的に `--dry-run` または `--allow-delete` が必要です。`--dry-run` は合計・テーブル別の追加／更新／削除／変更なし／スキップ件数を表示するだけで、DB の行・シーケンスを変更しません。適用時はロックを取得して差分を再計算します。論理キーは移行先の照合順序で事前検査しますが、予定件数や dry-run の成功は、DB 独自の制約・トリガーを含む将来の適用成功を保証しません。既定モードや `insert-only` にこれらのフラグは使用できません。
 
-**削除範囲は JSON の `org.rows` に含まれる組織に限定されます。** 通常のエクスポートは全組織を含むため、出力ファイルから対象組織のデータソース行を手動で省略すると、その行は削除対象になります。差分ファイルとしては扱いません。`org.rows` が空の場合は拒否します。対象組織の `data_source.rows` が空なら、その組織の全データソースを削除します。
+**削除範囲は version 3 の `scope.org_ids`（version 2 は `org.rows`）の組織に限定されます。** 通常のエクスポートは全組織を含むため、対象組織の選択済みリソース行を手動で省略すると、その行は削除対象になります。差分ファイルとしては扱いません。scope が空の場合は拒否します。選択したグループのテーブルが空なら、その scope 内のグループ全体を削除します。未選択グループは空データと見なさず保持します。
 
 | テーブル | 同期時の動作 |
 | --- | --- |
@@ -110,7 +126,37 @@ JSON には `password`、`basic_auth_password`、`secure_json_data` などを含
 
 DB エラーに機密カラム値が含まれる場合があるため、接続・書き込みエラーの詳細は CLI に表示しません。テーブル／行番号と DB 側のログを使って調査してください。
 
-## JSON 形式（version 2）
+## ダッシュボードの対応範囲
+
+**Grafana 12.2.0 の従来 SQL storage を検証対象とします。Unified Storage・dual-write・移行中の状態には対応しません。** `kv_store` の保存方式フラグを検査し、Unified Storage 等を示す値や未知の保存方式はエラーにします。DB 外の設定は移行しないため、移行元・先とも SQL storage で動作していることを管理者側でも確認してください。
+
+- ID／UID を保持します。フォルダ階層・タグ・全保存履歴を扱い、孤立参照・循環・タイトルや UID の不整合を拒否します。
+- `require-empty` は選択した4テーブルが空であることを要求します。対象UIDの既存権限も競合として拒否します。`insert-only` は既存 dashboard ID を優先し、その配下のタグ・履歴・権限だけを追記しません。
+- `sync` は scope 内のフォルダ・ダッシュボード・タグ・履歴・標準権限を同期します。再作成、UID／名前の交換、フォルダ移動に対応し、対象外組織は保持します。
+- Viewer／Editor の `managed:builtins:*:permissions` に属するリソース権限を、組織・標準ロール名・action・scope で保存します。移行先の role ID は名前と `builtin_role` の結び付きを検証して解決し、必要な管理ロールがなければトランザクション内で作成します。permission／role の元DB固有IDはコピーしません。
+- **ユーザー／チームの個別権限・カスタムロール・個別ACL・provisioning・公開共有・ライブラリパネル依存は拒否します。Grafana が作成者に自動付与した権限も個別権限として停止します。** 標準ロールの承認だけで個別権限を捨てることはありません。これらを持つ通常のダッシュボードでも本ツールでは移行できない場合があります。実データの権限を削除して回避せず、必要な権限と別途の移行方法を検討してください。
+- stars・playlist・annotations・alerts・library element 等は移行しません。移行先で削除や ID／UID／組織変更がこれらの参照を壊す場合は事前エラーにします。
+- dashboard本体・履歴JSONの静的な datasource UID／名前参照は、移行後のデータソース状態に対して確認します。`datasource` を選ばない場合は既存 DB を参照します。動的変数・プラグイン固有の外部参照は完全検査できず警告します。移行後に Grafana で表示とクエリを確認してください。
+- `created_by`／`updated_by`・保存履歴内の作成者IDは原値のままで、ユーザー自体は移行せず、IDも再マッピングしません。
+
+## JSON 形式（version 3）
+
+新しい export は選択対象だけを `tables` に保存します。例えば `--targets org` の簡略例は以下です。
+
+```json
+{
+  "version": 3,
+  "targets": ["org"],
+  "scope": {"org_ids": ["1"]},
+  "tables": {"org": {"columns": ["id", "name"], "rows": [["1", "Main Org."]]}}
+}
+```
+
+dashboard を含む場合は `dashboard_permissions` 配列も必須です。権限がなくても空配列 `[]` を明示し、他グループではこのフィールドを含めません。保存例の要素は `{"org_id":"1","role":"Viewer","action":"folders:read","scope":"folders:uid:folder-uid"}` です。targets・tables・scope・権限の対応を検証し、未知フィールドや重複JSONキーも拒否します。
+
+### version 2 の読み込み互換
+
+従来の以下の形式は `org,datasource` の入力として引き続き読み込めます。新規exportはversion 3です。
 
 ```json
 {
@@ -137,7 +183,7 @@ DB エラーに機密カラム値が含まれる場合があるため、接続�
 
 上記は形式のみを示す簡略例です。実際には DB の全カラムを保存します。行内の値は `columns` の順序に対応し、非 NULL 値はすべて文字列、SQL NULL は JSON `null` として保存します。これにより 64 bit ID や空文字列と NULL の区別を保持します。真偽値は `"0"`／`"1"`、日時は RFC3339Nano です。`binary_columns` で指定したカラムは Base64、その他は従来通りの文字列です。移行先のカラム型に従って変換します。整数・真偽値・日時・UTF-8 テキスト・バイナリ以外の型は対象外です。
 
-version 1 のファイルは鍵テーブルを含まず、不完全な暗号化情報の移行を避けるため受け付けません。version 2 で再エクスポートしてください。空のテーブルも `columns` と空の `rows` 配列を含めて保存します。
+version 1 のファイルは鍵テーブルを含まず、不完全な暗号化情報の移行を避けるため受け付けません。version 3 で再エクスポートしてください。空の選択対象テーブルも `columns` と空の `rows` 配列を含めて保存します。
 
 ## 開発・検証
 
@@ -154,7 +200,9 @@ make integration  # 一時的な MySQL 8.4 / PostgreSQL 17 を Docker で起動�
 
 `sync` でも両 DB 間の4経路とCLIを検証します。同名・別IDの再作成、更新・削除・再実行、対象外組織と用途の保護、共有鍵の非上書き、dry-run、制約違反時のロールバックを確認します。
 
-既存の **空の使い捨てテスト DB** を使う場合は、`MYSQL_TEST_DSN` と `POSTGRES_TEST_DSN` を設定して以下を実行できます。テストは `org`・`data_source`・`data_keys`・`secrets`・`dashboard` を作成し、終了時に削除します。**本番 DB を指定しないでください。** テストは代表的なカラムのスキーマを使用し、Grafana 本体は起動しません。
+ダッシュボードも全7通りの対象指定×3モード×DB間4経路を検証します。ネストフォルダ・タグ・複数履歴・静的参照・標準権限、UID交換・移動・再作成・削除、既存親の子データ保持、他グループ／組織の保護、Unified Storage・個別権限・対象外依存の拒否、dry-run の行・PostgreSQLシーケンス不変性、失敗時ロールバックを含みます。
+
+既存の **空の使い捨てテスト DB** を使う場合は、`MYSQL_TEST_DSN` と `POSTGRES_TEST_DSN` を設定して以下を実行できます。テストは対象テーブル・権限テーブル・保存方式／依存検査用テーブルを作成し、終了時に削除します。**本番 DB を指定しないでください。** テストは代表的なカラムのスキーマを使用し、Grafana 本体は起動しません。
 
 ```sh
 go test -race -tags=integration -p 1 ./internal/cli ./internal/syncdb -count=1 -v
@@ -165,3 +213,5 @@ GitHub Actions でも lint・単体テスト・ビルド・実 DB テストを�
 追加の手動検証では Grafana 12.2.0 本体の SQL スキーマと共通の `secret_key` を使用し、MySQL → PostgreSQL → MySQL の移行後に、現行鍵と無効化済み鍵で暗号化されたデータソースの HTTP ヘッダーが復号・送信されることを API プロキシ経由で確認しました。KMS／Enterprise 暗号方式は未検証です。
 
 `sync` も Grafana 12.2.0 本体で MySQL → PostgreSQL／PostgreSQL → MySQL の両方向を検証しました。同名データソースを別 ID で再作成し、新しい暗号鍵を追加した状態で、dry-run の不変性、実適用、再実行、移行鍵が無効のまま秘密 HTTP ヘッダーを復号・送信できることを確認しています。`insert-only` の検証は上記の代表的な SQL スキーマによる統合テストです。
+
+ダッシュボードも Grafana 12.2.0 の実スキーマで MySQL↔PostgreSQL を検証し、API経由で移行後のネストフォルダ・タグ・履歴取得、Viewerの参照と書き込み拒否、Editorの保存、暗号化データソースの利用を確認しました。自動生成される作成者個別権限は最初にexport拒否を確認し、標準ロールのみの使い捨てfixtureで移行を検証しています。個別権限を移行できることを意味しません。

@@ -26,15 +26,20 @@ func (mode ImportMode) Validate() error {
 }
 
 type ImportResult struct {
-	Inserted   int
-	Skipped    int
-	Updated    int
-	Deleted    int
-	Unchanged  int
-	Org        TableResult
-	DataKeys   TableResult
-	DataSource TableResult
-	Secrets    TableResult
+	Inserted             int
+	Skipped              int
+	Updated              int
+	Deleted              int
+	Unchanged            int
+	Org                  TableResult
+	DataKeys             TableResult
+	DataSource           TableResult
+	Secrets              TableResult
+	Dashboard            TableResult
+	Folder               TableResult
+	DashboardTag         TableResult
+	DashboardVersion     TableResult
+	DashboardPermissions TableResult
 }
 
 type TableResult struct {
@@ -60,7 +65,7 @@ func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportM
 	if err := s.Validate(); err != nil {
 		return ImportResult{}, err
 	}
-	if err := d.checkStorage(ctx); err != nil {
+	if err := d.checkStorage(ctx, s.Selection()); err != nil {
 		return ImportResult{}, err
 	}
 	tx, err := d.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
@@ -68,10 +73,8 @@ func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportM
 		return ImportResult{}, errors.New("cannot begin import transaction")
 	}
 	defer tx.Rollback()
-	if d.Engine == "postgres" {
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE "org", "data_keys", "data_source", "secrets" IN EXCLUSIVE MODE`); err != nil {
-			return ImportResult{}, errors.New("cannot lock target tables")
-		}
+	if err := d.lockTargets(ctx, tx, s); err != nil {
+		return ImportResult{}, err
 	}
 	if mode == ImportRequireEmpty {
 		for _, entry := range s.entries() {
@@ -80,7 +83,16 @@ func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportM
 			}
 		}
 	}
-	var result ImportResult
+	prepared, skipped, err := d.prepareImport(ctx, tx, s, mode)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	s = prepared
+	permissions, err := d.planDashboardPermissions(ctx, tx, s, mode)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	result := ImportResult{Skipped: skipped}
 	inserted := make(map[string]int)
 	for _, entry := range s.entries() {
 		counts, err := d.insertTable(ctx, tx, entry, mode)
@@ -91,6 +103,10 @@ func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportM
 		result.Skipped += counts.Skipped
 		inserted[entry.name] = counts.Inserted
 	}
+	if err := d.applyDashboardPermissions(ctx, tx, permissions); err != nil {
+		return ImportResult{}, err
+	}
+	addPermissionCounts(&result, permissions.count)
 	if d.Engine == "postgres" {
 		for _, entry := range s.entries() {
 			if !entry.numeric || (mode == ImportInsertOnly && inserted[entry.name] == 0) {

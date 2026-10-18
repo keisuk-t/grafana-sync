@@ -111,3 +111,30 @@ func TestImportModeFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestTargetsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for _, command := range []string{"export", "import"} {
+		for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+			err := Run(context.Background(), []string{command, "-db", "mysql", "-file", "missing.json", "--targets", targets.String()}, &bytes.Buffer{}, &bytes.Buffer{})
+			if err == nil || err.Error() != "DSN environment variable is unset or empty" {
+				t.Fatalf("valid targets rejected: %v", err)
+			}
+		}
+		for _, value := range []string{"", "org,", "data_source", "dashboard,dashboard", "unknown"} {
+			err := Run(context.Background(), []string{command, "-db", "mysql", "-file", "missing.json", "--targets", value}, &bytes.Buffer{}, &bytes.Buffer{})
+			if err == nil || strings.Contains(err.Error(), "DSN") {
+				t.Fatalf("invalid targets accepted: %v", err)
+			}
+		}
+	}
+	path := filepath.Join(t.TempDir(), "org.json")
+	s := &syncdb.Snapshot{Version: 3, Targets: []string{"org"}, Scope: syncdb.Scope{OrgIDs: []string{}}, Org: syncdb.Table{Columns: []string{"id"}, Rows: [][]*string{}}}
+	if err := writeSnapshot(path, s); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	if err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", path}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "absent") {
+		t.Fatalf("default inferred absent targets: %v", err)
+	}
+}
