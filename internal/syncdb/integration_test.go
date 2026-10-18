@@ -218,6 +218,7 @@ func insertOnlyTarget(t *testing.T, ctx context.Context, db *Database, source *S
 	extra[columnIndex(s.Org.Columns, "id")] = str("9007199254741093")
 	extra[columnIndex(s.Org.Columns, "name")] = str("target-only-org")
 	s.Org.Rows = append(s.Org.Rows, extra)
+	s.Scope.OrgIDs = append(s.Scope.OrgIDs, "9007199254741093")
 	if err := db.Import(ctx, s); err != nil {
 		t.Fatal(err)
 	}
@@ -252,6 +253,7 @@ func testInsertOnly(t *testing.T, ctx context.Context, db *Database, source *Sna
 			entry.table.Rows[0] = existing.entries()[i].table.Rows[0]
 		}
 		want.Org.Rows = append(want.Org.Rows, existing.Org.Rows[1])
+		want.Scope.OrgIDs = append(want.Scope.OrgIDs, "9007199254741093")
 		assertSnapshot(t, ctx, db, want)
 		result, err = db.ImportWithMode(ctx, source, ImportInsertOnly)
 		if err != nil || result != (ImportResult{Skipped: 7}) {
@@ -268,6 +270,7 @@ func testInsertOnly(t *testing.T, ctx context.Context, db *Database, source *Sna
 			extra[columnIndex(incoming.Org.Columns, "id")] = str("2")
 			extra[columnIndex(incoming.Org.Columns, "name")] = str("new-org")
 			incoming.Org.Rows = append(incoming.Org.Rows, extra)
+			incoming.Scope.OrgIDs = append(incoming.Scope.OrgIDs, "2")
 			switch name {
 			case "data_source_unique":
 				extra := append([]*string(nil), incoming.DataSource.Rows[0]...)
@@ -348,6 +351,7 @@ func testSync(t *testing.T, ctx context.Context, db *Database, source *Snapshot)
 	org[columnIndex(initial.Org.Columns, "id")] = str(protectedOrgID)
 	org[columnIndex(initial.Org.Columns, "name")] = str("protected-org")
 	initial.Org.Rows = append(initial.Org.Rows, org)
+	initial.Scope.OrgIDs = append(initial.Scope.OrgIDs, protectedOrgID)
 	datasource := append([]*string(nil), initial.DataSource.Rows[0]...)
 	datasource[columnIndex(initial.DataSource.Columns, "id")] = str("500")
 	datasource[columnIndex(initial.DataSource.Columns, "org_id")] = str(protectedOrgID)
@@ -510,6 +514,7 @@ func testSync(t *testing.T, ctx context.Context, db *Database, source *Snapshot)
 	newOrg[columnIndex(empty.Org.Columns, "id")] = str("700")
 	newOrg[columnIndex(empty.Org.Columns, "name")] = str("new-empty-org")
 	empty.Org.Rows = append(empty.Org.Rows, newOrg)
+	empty.Scope.OrgIDs = append(empty.Scope.OrgIDs, "700")
 	preview, err = db.Sync(ctx, empty, SyncOptions{DryRun: true})
 	if err != nil || preview.Org.Inserted != 1 || preview.DataSource.Deleted != 3 || preview.Secrets.Deleted != 3 {
 		t.Fatalf("empty scope plan incorrect: %+v %v", preview, err)

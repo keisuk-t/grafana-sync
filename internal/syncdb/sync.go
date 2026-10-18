@@ -17,8 +17,9 @@ import (
 )
 
 type SyncOptions struct {
-	DryRun      bool
-	AllowDelete bool
+	DryRun       bool
+	AllowDelete  bool
+	PrincipalMap *PrincipalMap
 }
 
 type syncTablePlan struct {
@@ -32,22 +33,30 @@ type syncTablePlan struct {
 }
 
 func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (ImportResult, error) {
+	if s != nil && s.LibraryPanelsExcluded && s.Selection().Has(TargetDashboard) {
+		return ImportResult{}, errors.New("dashboard sync is not allowed for snapshots with library_panels_excluded; use require-empty or insert-only")
+	}
+	if s != nil {
+		copy := *s
+		copy.principalMap = options.PrincipalMap
+		s = &copy
+	}
 	if !options.DryRun && !options.AllowDelete {
 		return ImportResult{}, errors.New("sync requires --allow-delete or --dry-run")
 	}
 	if err := s.Validate(); err != nil {
 		return ImportResult{}, err
 	}
-	if len(s.Org.Rows) == 0 {
+	if len(s.ScopeIDs()) == 0 {
 		return ImportResult{}, errors.New("sync requires at least one organization in the snapshot")
 	}
-	if columnIndex(s.Org.Columns, "name") < 0 {
+	if s.Selection().Has(TargetOrg) && columnIndex(s.Org.Columns, "name") < 0 {
 		return ImportResult{}, errors.New("sync requires org.name")
 	}
-	if columnIndex(s.DataKeys.Columns, "active") < 0 {
+	if s.Selection().Has(TargetDatasource) && columnIndex(s.DataKeys.Columns, "active") < 0 {
 		return ImportResult{}, errors.New("sync requires data_keys.active to preserve the target encryption key selection")
 	}
-	if err := d.checkStorage(ctx); err != nil {
+	if err := d.checkStorage(ctx, s.Selection()); err != nil {
 		return ImportResult{}, err
 	}
 	tx, err := d.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
@@ -55,9 +64,15 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 		return ImportResult{}, errors.New("cannot begin sync transaction")
 	}
 	defer tx.Rollback()
-	if d.Engine == "postgres" {
-		if _, err := tx.ExecContext(ctx, `LOCK TABLE "org", "data_keys", "data_source", "secrets" IN EXCLUSIVE MODE`); err != nil {
-			return ImportResult{}, errors.New("cannot lock target tables")
+	if err := d.lockTargets(ctx, tx, s); err != nil {
+		return ImportResult{}, err
+	}
+	if err := d.checkOrganizations(ctx, tx, s); err != nil {
+		return ImportResult{}, err
+	}
+	if s.Selection().Has(TargetDashboard) {
+		if err := d.checkDashboardStorage(ctx, tx); err != nil {
+			return ImportResult{}, err
 		}
 	}
 	targets := make(map[string]Table)
@@ -76,6 +91,13 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 	if err != nil {
 		return ImportResult{}, err
 	}
+	if err := d.prepareDashboardSync(ctx, tx, s, plans, targets); err != nil {
+		return ImportResult{}, err
+	}
+	permissions, err := d.planDashboardPermissions(ctx, tx, s, ImportSync)
+	if err != nil {
+		return ImportResult{}, err
+	}
 	var result ImportResult
 	for _, plan := range plans {
 		switch plan.entry.name {
@@ -87,6 +109,18 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 			result.DataSource = plan.count
 		case "secrets":
 			result.Secrets = plan.count
+		case "folder":
+			result.Folder = plan.count
+		case "dashboard":
+			result.Dashboard = plan.count
+		case "dashboard_tag":
+			result.DashboardTag = plan.count
+		case "dashboard_version":
+			result.DashboardVersion = plan.count
+		case "library_element":
+			result.LibraryElement = plan.count
+		case "library_element_connection":
+			result.LibraryConnection = plan.count
 		}
 		result.Inserted += plan.count.Inserted
 		result.Updated += plan.count.Updated
@@ -94,25 +128,39 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 		result.Unchanged += plan.count.Unchanged
 		result.Skipped += plan.count.Skipped
 	}
+	addPermissionCounts(&result, permissions.count)
+	addRBACCounts(&result, permissions.rbac)
 	if options.DryRun {
 		return result, nil
+	}
+	if err := d.applyRBACDeletes(ctx, tx, permissions.rbac); err != nil {
+		return ImportResult{}, err
 	}
 	byName := make(map[string]*syncTablePlan)
 	for _, plan := range plans {
 		byName[plan.entry.name] = plan
 	}
 	for _, name := range []string{"org", "data_keys"} {
+		if byName[name] == nil {
+			continue
+		}
 		if err := d.syncInsert(ctx, tx, byName[name]); err != nil {
 			return ImportResult{}, err
 		}
 	}
 	for _, name := range []string{"secrets", "data_source"} {
+		if byName[name] == nil {
+			continue
+		}
 		if err := d.syncDelete(ctx, tx, byName[name]); err != nil {
 			return ImportResult{}, err
 		}
 	}
 	for _, name := range []string{"data_source", "secrets"} {
 		plan := byName[name]
+		if plan == nil {
+			continue
+		}
 		if err := d.syncUpdate(ctx, tx, plan, types[name]); err != nil {
 			return ImportResult{}, err
 		}
@@ -120,9 +168,16 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 			return ImportResult{}, err
 		}
 	}
+	if err := d.applyDashboardSync(ctx, tx, byName, types); err != nil {
+		return ImportResult{}, err
+	}
+	if err := d.applyDashboardPermissions(ctx, tx, permissions); err != nil {
+		return ImportResult{}, err
+	}
 	if d.Engine == "postgres" {
-		for _, name := range []string{"org", "data_source", "secrets"} {
-			if byName[name].count.Inserted > 0 {
+		for _, plan := range plans {
+			name := plan.entry.name
+			if plan.entry.numeric && plan.count.Inserted > 0 {
 				if err := d.restartSequence(ctx, tx, name, true); err != nil {
 					return ImportResult{}, err
 				}
@@ -206,7 +261,11 @@ func checkSyncColumns(source *Table, target Table, kinds map[string]string) erro
 }
 
 func syncID(row []*string, columns []string, key string) (int64, error) {
-	return positiveID(row[columnIndex(columns, key)])
+	i := columnIndex(columns, key)
+	if i < 0 || i >= len(row) {
+		return 0, errors.New("missing numeric key")
+	}
+	return positiveID(row[i])
 }
 
 func syncRowsByID(table Table, key string) map[int64][]*string {
@@ -253,11 +312,7 @@ func (d *Database) planSync(ctx context.Context, tx *sql.Tx, s *Snapshot, target
 	if err := d.checkSyncUnique(ctx, tx, s, targets["org"]); err != nil {
 		return nil, err
 	}
-	orgIDs := make(map[int64]bool)
-	for _, row := range s.Org.Rows {
-		id, _ := syncID(row, s.Org.Columns, "id")
-		orgIDs[id] = true
-	}
+	orgIDs := s.scopeIDs()
 	plans := make([]*syncTablePlan, 0, 4)
 	for _, entry := range s.entries() {
 		target := targets[entry.name]
@@ -319,7 +374,13 @@ func (d *Database) planSync(ctx context.Context, tx *sql.Tx, s *Snapshot, target
 			old, ok := byID[id]
 			if ok && entry.name != "org" {
 				oldOrg, _ := syncID(old, target.Columns, "org_id")
-				if !orgIDs[oldOrg] || (entry.name == "secrets" && (old[columnIndex(target.Columns, "type")] == nil || *old[columnIndex(target.Columns, "type")] != "datasource")) {
+				inScope := orgIDs[oldOrg]
+				if entry.group == TargetDashboard {
+					e := entry
+					e.table = &target
+					inScope = dashboardRowInScope(e, old, syncRowsByID(targets["dashboard"], "id"), targets["dashboard"].Columns, orgIDs)
+				}
+				if !inScope || (entry.name == "secrets" && (old[columnIndex(target.Columns, "type")] == nil || *old[columnIndex(target.Columns, "type")] != "datasource")) {
 					return nil, fmt.Errorf("%s id %d belongs to a protected row outside the sync scope", entry.name, id)
 				}
 			}
@@ -365,10 +426,16 @@ func (d *Database) planSync(ctx context.Context, tx *sql.Tx, s *Snapshot, target
 				}
 			}
 		}
-		if entry.name == "data_source" || entry.name == "secrets" {
+		if entry.name == "data_source" || entry.name == "secrets" || entry.group == TargetDashboard {
 			for _, row := range target.Rows {
 				orgID, _ := syncID(row, target.Columns, "org_id")
-				if !orgIDs[orgID] {
+				inScope := orgIDs[orgID]
+				if entry.group == TargetDashboard {
+					e := entry
+					e.table = &target
+					inScope = dashboardRowInScope(e, row, syncRowsByID(targets["dashboard"], "id"), targets["dashboard"].Columns, orgIDs)
+				}
+				if !inScope {
 					continue
 				}
 				if entry.name == "secrets" && (row[columnIndex(target.Columns, "type")] == nil || *row[columnIndex(target.Columns, "type")] != "datasource") {
@@ -391,6 +458,11 @@ func stringPtr(s string) *string { return &s }
 var syncSQLIdentifier = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 func (d *Database) checkSyncUnique(ctx context.Context, tx *sql.Tx, s *Snapshot, targetOrg Table) error {
+	if s.Selection().Has(TargetDashboard) {
+		if err := d.checkDashboardUnique(ctx, tx, s); err != nil {
+			return err
+		}
+	}
 	org := s.Org
 	org.Rows = nil
 	storedOrgs := syncRowsByID(targetOrg, "id")
@@ -449,6 +521,22 @@ func (d *Database) checkSyncUnique(ctx context.Context, tx *sql.Tx, s *Snapshot,
 		if err != sql.ErrNoRows {
 			return fmt.Errorf("cannot compare %s.%s logical keys", spec.name, spec.column)
 		}
+	}
+	return nil
+}
+
+func (d *Database) checkUniquePayload(ctx context.Context, tx *sql.Tx, query string, values any) error {
+	payload, err := json.Marshal(values)
+	if err != nil {
+		return errors.New("cannot encode logical keys")
+	}
+	var duplicate int
+	err = tx.QueryRowContext(ctx, query, string(payload)).Scan(&duplicate)
+	if err == nil {
+		return errors.New("dashboard group contains colliding logical keys")
+	}
+	if err != sql.ErrNoRows {
+		return errors.New("cannot compare dashboard logical keys")
 	}
 	return nil
 }
@@ -517,7 +605,7 @@ func (d *Database) syncUpdate(ctx context.Context, tx *sql.Tx, plan *syncTablePl
 		old := plan.previous[id]
 		orgID, _ := syncID(row, cols, "org_id")
 		oldOrgID, _ := syncID(old, plan.targetColumns, "org_id")
-		for _, col := range []string{"name", "uid", "namespace"} {
+		for _, col := range []string{"name", "uid", "namespace", "title", "slug"} {
 			index := columnIndex(cols, col)
 			if index < 0 {
 				continue
@@ -525,6 +613,18 @@ func (d *Database) syncUpdate(ctx context.Context, tx *sql.Tx, plan *syncTablePl
 			equal, err := syncEqual(row[index], old[columnIndex(plan.targetColumns, col)], kinds[col])
 			if err != nil {
 				return fmt.Errorf("%s id %d has an invalid logical key", entry.name, id)
+			}
+			if col == "title" {
+				parent := "folder_uid"
+				if entry.name == "folder" {
+					parent = "parent_uid"
+				}
+				if cell(*entry.table, row, parent) != cell(Table{Columns: plan.targetColumns}, old, parent) {
+					equal = false
+				}
+			}
+			if col == "name" && entry.name == "library_element" && cell(*entry.table, row, "folder_uid") != cell(Table{Columns: plan.targetColumns}, old, "folder_uid") {
+				equal = false
 			}
 			if !equal || orgID != oldOrgID {
 				temp, err := temporaryKey()

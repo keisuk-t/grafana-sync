@@ -21,6 +21,24 @@ type Database struct {
 	Engine string
 }
 
+type ExportOptions struct {
+	ExcludeLibraryPanelDashboards bool
+	RehomeOrphanLibraryPanels     bool
+	RenameCollidingLibraryPanels  bool
+}
+
+type ExportResult struct {
+	ExcludedLibraryDashboards       int
+	ExcludedLibraryPanels           int
+	ExcludedLibraryConnections      int
+	ExcludedLibraryHistory          int
+	ExcludedLibraryTags             int
+	Snapshot                        *Snapshot
+	RehomedLibraryPanels            int
+	RenamedLibraryPanels            int
+	OmittedOrphanLibraryConnections int
+}
+
 func Open(ctx context.Context, engine, dsn string) (*Database, error) {
 	var db *sql.DB
 	switch engine {
@@ -66,11 +84,11 @@ func (d *Database) quote(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-func (d *Database) checkStorage(ctx context.Context) error {
+func (d *Database) checkStorage(ctx context.Context, targets Targets) error {
 	if d.Engine != "mysql" {
 		return nil
 	}
-	for _, entry := range (&Snapshot{}).entries() {
+	for _, entry := range (&Snapshot{Version: 4, Targets: targets.Names()}).entries() {
 		name := entry.name
 		var engine string
 		if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil {
@@ -80,11 +98,52 @@ func (d *Database) checkStorage(ctx context.Context) error {
 			return fmt.Errorf("%s must use InnoDB for transactional transfer", name)
 		}
 	}
+	if targets.Has(TargetDashboard) {
+		for _, name := range []string{"role", "builtin_role", "permission", "user_role", "team_role", "dashboard_acl", "user", "org_user", "team", "team_member"} {
+			var engine string
+			err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine)
+			if err == sql.ErrNoRows && name != "role" && name != "builtin_role" && name != "permission" {
+				continue
+			}
+			if err != nil || !strings.EqualFold(engine, "InnoDB") {
+				return fmt.Errorf("%s must exist and use InnoDB for transactional dashboard permissions", name)
+			}
+		}
+	}
 	return nil
 }
 
 func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
-	if err := d.checkStorage(ctx); err != nil {
+	return d.ExportTargets(ctx, DefaultTargets)
+}
+
+func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapshot, error) {
+	result, err := d.ExportWithOptions(ctx, targets, ExportOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return result.Snapshot, nil
+}
+
+func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, options ExportOptions) (*ExportResult, error) {
+	if err := targets.Validate(); err != nil {
+		return nil, err
+	}
+	if options.ExcludeLibraryPanelDashboards {
+		if !targets.Has(TargetDashboard) {
+			return nil, errors.New("--exclude-library-panel-dashboards requires --targets including dashboard")
+		}
+		if options.RehomeOrphanLibraryPanels || options.RenameCollidingLibraryPanels {
+			return nil, errors.New("--exclude-library-panel-dashboards cannot be combined with library rehome or rename options")
+		}
+	}
+	if options.RehomeOrphanLibraryPanels && !targets.Has(TargetDashboard) {
+		return nil, errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
+	}
+	if options.RenameCollidingLibraryPanels && !options.RehomeOrphanLibraryPanels {
+		return nil, errors.New("--rename-colliding-library-panels requires --rehome-orphan-library-panels")
+	}
+	if err := d.checkStorage(ctx, targets); err != nil {
 		return nil, err
 	}
 	tx, err := d.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
@@ -92,9 +151,67 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 		return nil, errors.New("cannot begin export transaction")
 	}
 	defer tx.Rollback()
-	s := &Snapshot{Version: 2}
+	s := &Snapshot{Version: 5, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
+	result := &ExportResult{Snapshot: s}
+	org, err := d.readTable(ctx, tx, (&Snapshot{Version: 2}).entries()[0])
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range org.Rows {
+		s.Scope.OrgIDs = append(s.Scope.OrgIDs, cell(org, row, "id"))
+	}
 	for _, entry := range s.entries() {
 		*entry.table, err = d.readTable(ctx, tx, entry)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if targets.Has(TargetDashboard) {
+		var excluded map[string]bool
+		if options.ExcludeLibraryPanelDashboards {
+			beforeDashboards, beforeHistory, beforeTags := len(s.Dashboard.Rows), len(s.DashboardVersion.Rows), len(s.DashboardTag.Rows)
+			result.ExcludedLibraryPanels, result.ExcludedLibraryConnections = len(s.LibraryElement.Rows), len(s.LibraryConnection.Rows)
+			excluded, err = s.excludeLibraryPanelDashboards()
+			if err != nil {
+				return nil, err
+			}
+			result.ExcludedLibraryDashboards = beforeDashboards - len(s.Dashboard.Rows)
+			result.ExcludedLibraryHistory = beforeHistory - len(s.DashboardVersion.Rows)
+			result.ExcludedLibraryTags = beforeTags - len(s.DashboardTag.Rows)
+		}
+		if public := columnIndex(s.Dashboard.Columns, "is_public"); public >= 0 {
+			for _, row := range s.Dashboard.Rows {
+				if cell(s.Dashboard, row, "is_public") == "1" {
+					value := "0"
+					row[public] = &value
+				}
+			}
+		}
+		if err := d.checkDashboardStorage(ctx, tx); err != nil {
+			return nil, err
+		}
+		if err := d.guardDashboardDependenciesWithRBAC(ctx, tx, s.Dashboard, false, true); err != nil {
+			return nil, err
+		}
+		s.RBAC, err = d.readRBAC(ctx, tx, permissionResources(s.Dashboard, s.LibraryElement))
+		if err != nil {
+			return nil, err
+		}
+		aclRows, err := d.readLegacyACLWithExclusions(ctx, tx, s.Dashboard, s.ScopeIDs(), s.RBAC, true, excluded)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range aclRows {
+			s.RBAC.LegacyACL = append(s.RBAC.LegacyACL, row.RBACACL)
+		}
+		canonicalizeManagedRBAC(s.RBAC)
+		result.OmittedOrphanLibraryConnections, err = s.omitOrphanLibraryConnections()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if options.RehomeOrphanLibraryPanels {
+		result.RehomedLibraryPanels, result.RenamedLibraryPanels, err = s.rehomeOrphanLibraryPanelsWithOptions(options.RenameCollidingLibraryPanels)
 		if err != nil {
 			return nil, err
 		}
@@ -105,7 +222,7 @@ func (d *Database) Export(ctx context.Context) (*Snapshot, error) {
 	if err := tx.Commit(); err != nil {
 		return nil, errors.New("cannot commit export transaction")
 	}
-	return s, nil
+	return result, nil
 }
 
 func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) (Table, error) {
@@ -116,6 +233,19 @@ func (d *Database) readTable(ctx context.Context, tx *sql.Tx, entry tableEntry) 
 			SELECT 1 FROM %[2]s
 			WHERE %[2]s.%[3]s = %[4]s.%[3]s AND %[2]s.%[5]s = %[4]s.%[6]s
 		)`, d.quote("type"), d.quote("data_source"), d.quote("org_id"), d.quote("secrets"), d.quote("name"), d.quote("namespace"))
+	}
+	if name == "dashboard_tag" || name == "dashboard_version" {
+		query += " WHERE EXISTS (SELECT 1 FROM " + d.quote("dashboard") + " WHERE " + d.quote("dashboard") + "." + d.quote("id") + " = " + d.quote(name) + "." + d.quote("dashboard_id") + ")"
+	}
+	if name == "dashboard_tag" {
+		// Retain ambiguous metadata for validation; omit only unambiguous UID orphans.
+		query += fmt.Sprintf(` AND (
+			%[1]s.org_id IS NULL OR %[1]s.dashboard_uid IS NULL OR %[1]s.dashboard_uid = ''
+			OR EXISTS (SELECT 1 FROM %[2]s parent
+				WHERE parent.id = %[1]s.dashboard_id AND parent.org_id <> %[1]s.org_id)
+			OR EXISTS (SELECT 1 FROM %[2]s resource
+				WHERE resource.org_id = %[1]s.org_id AND resource.uid = %[1]s.dashboard_uid)
+		)`, d.quote(name), d.quote("dashboard"))
 	}
 	rows, err := tx.QueryContext(ctx, query+" ORDER BY "+d.quote(entry.key))
 	if err != nil {
