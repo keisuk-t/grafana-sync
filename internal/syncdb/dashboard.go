@@ -36,6 +36,9 @@ func (s *Snapshot) validateDashboards(scope map[int64]bool) error {
 	if err := s.validateDashboardState(scope, true); err != nil {
 		return err
 	}
+	if err := s.validateLibraryState(scope); err != nil {
+		return err
+	}
 	return s.validateDashboardPermissions()
 }
 
@@ -176,15 +179,6 @@ func dashboardDocument(data string) (map[string]any, error) {
 	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil || document == nil || !json.Valid([]byte(data)) {
 		return nil, errors.New("invalid dashboard JSON document")
-	}
-	var library bool
-	walkDocument(document, func(key string, value any) {
-		if key == "libraryPanel" && value != nil {
-			library = true
-		}
-	})
-	if library {
-		return nil, errors.New("library panels are not supported; migrate their dependencies separately")
 	}
 	return document, nil
 }

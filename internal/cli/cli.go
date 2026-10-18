@@ -128,7 +128,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			for _, entry := range []struct {
 				name  string
 				count syncdb.TableResult
-			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}} {
+			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"library_element", result.LibraryElement}, {"library_element_connection", result.LibraryConnection}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}} {
 				if !tableSelected(entry.name, targets) {
 					continue
 				}
@@ -152,7 +152,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 	}
-	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d dashboard=%d folder=%d dashboard_tag=%d dashboard_version=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows), len(snapshot.Dashboard.Rows), len(snapshot.Folder.Rows), len(snapshot.DashboardTag.Rows), len(snapshot.DashboardVersion.Rows))
+	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d dashboard=%d folder=%d dashboard_tag=%d dashboard_version=%d library_element=%d library_element_connection=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows), len(snapshot.Dashboard.Rows), len(snapshot.Folder.Rows), len(snapshot.DashboardTag.Rows), len(snapshot.DashboardVersion.Rows), len(snapshot.LibraryElement.Rows), len(snapshot.LibraryConnection.Rows))
 	return err
 }
 
@@ -170,7 +170,11 @@ func tableSelected(name string, targets syncdb.Targets) bool {
 func printSelection(out io.Writer, s *syncdb.Snapshot) error {
 	_, err := fmt.Fprintf(out, "targets=%s scope.org_ids=%s\n", s.Selection(), strings.Join(s.ScopeIDs(), ","))
 	if err == nil && s.Selection().Has(syncdb.TargetDashboard) {
-		_, err = fmt.Fprintln(out, "dashboard tables: dashboard,folder,dashboard_tag,dashboard_version; includes Viewer/Editor permissions; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
+		tables := "dashboard,folder,dashboard_tag,dashboard_version"
+		if s.Version >= 4 {
+			tables += ",library_element,library_element_connection"
+		}
+		_, err = fmt.Fprintln(out, "dashboard tables: "+tables+"; includes Viewer/Editor permissions; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
 	}
 	return err
 }

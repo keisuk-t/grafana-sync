@@ -20,6 +20,9 @@ func (d *Database) lockTargets(ctx context.Context, tx *sql.Tx, s *Snapshot) err
 		for _, name := range []string{"role", "builtin_role", "permission"} {
 			names = append(names, d.quote(name))
 		}
+		if s.Version < 4 {
+			names = append(names, d.quote("library_element"), d.quote("library_element_connection"))
+		}
 	}
 	if _, err := tx.ExecContext(ctx, "LOCK TABLE "+strings.Join(names, ", ")+" IN EXCLUSIVE MODE"); err != nil {
 		return errors.New("cannot lock target tables")
@@ -68,10 +71,14 @@ func (d *Database) prepareImport(ctx context.Context, tx *sql.Tx, s *Snapshot, m
 	skipped := 0
 	if mode == ImportInsertOnly {
 		existing := syncRowsByID(targets["dashboard"], "id")
-		for _, table := range []*Table{&prepared.DashboardTag, &prepared.DashboardVersion} {
+		for _, table := range []*Table{&prepared.DashboardTag, &prepared.DashboardVersion, &prepared.LibraryConnection} {
 			rows := [][]*string{}
 			for _, row := range table.Rows {
-				id, _ := syncID(row, table.Columns, "dashboard_id")
+				parent := "dashboard_id"
+				if table == &prepared.LibraryConnection {
+					parent = "connection_id"
+				}
+				id, _ := syncID(row, table.Columns, parent)
 				if existing[id] != nil {
 					skipped++
 					continue
@@ -119,7 +126,10 @@ func (d *Database) validateDashboardOutcome(ctx context.Context, tx *sql.Tx, s *
 	if !s.Selection().Has(TargetDashboard) {
 		return nil
 	}
-	effective := Snapshot{Version: 3, Targets: []string{"dashboard"}, Scope: s.Scope}
+	if err := d.preserveLegacyLibraries(ctx, tx, s, final); err != nil {
+		return err
+	}
+	effective := Snapshot{Version: 4, Targets: []string{"dashboard"}, Scope: s.Scope}
 	for _, entry := range effective.entries() {
 		*entry.table = final[entry.name]
 	}
@@ -137,6 +147,9 @@ func (d *Database) validateDashboardOutcome(ctx context.Context, tx *sql.Tx, s *
 	if err := effective.validateDashboardState(scope, false); err != nil {
 		return err
 	}
+	if err := effective.validateLibraryState(scope); err != nil {
+		return err
+	}
 	sources, ok := final["data_source"]
 	documents := make(map[int64][]string)
 	for _, row := range effective.Dashboard.Rows {
@@ -147,6 +160,10 @@ func (d *Database) validateDashboardOutcome(ctx context.Context, tx *sql.Tx, s *
 		id, _ := syncID(row, effective.DashboardVersion.Columns, "dashboard_id")
 		org := rowOrg(effective.Dashboard, parents[id])
 		documents[org] = append(documents[org], cell(effective.DashboardVersion, row, "data"))
+	}
+	for _, row := range effective.LibraryElement.Rows {
+		org := rowOrg(effective.LibraryElement, row)
+		documents[org] = append(documents[org], cell(effective.LibraryElement, row, "model"))
 	}
 	for org, payloads := range documents {
 		for _, payload := range payloads {
@@ -183,8 +200,12 @@ func (d *Database) validateDashboardOutcome(ctx context.Context, tx *sql.Tx, s *
 }
 
 func dashboardRowInScope(entry tableEntry, row []*string, parents map[int64][]*string, columns []string, scope map[int64]bool) bool {
-	if entry.name == "dashboard_tag" || entry.name == "dashboard_version" {
-		id, err := syncID(row, entry.table.Columns, "dashboard_id")
+	if entry.name == "dashboard_tag" || entry.name == "dashboard_version" || entry.name == "library_element_connection" {
+		key := "dashboard_id"
+		if entry.name == "library_element_connection" {
+			key = "connection_id"
+		}
+		id, err := syncID(row, entry.table.Columns, key)
 		if err != nil || parents[id] == nil {
 			return false
 		}

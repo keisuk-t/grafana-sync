@@ -41,12 +41,26 @@ func permissionScope(t Table, row []*string) string {
 	return kind + ":uid:" + cell(t, row, "uid")
 }
 
+type permissionResource struct{ org, uid, kind string }
+
+func permissionResources(dashboards, libraries Table) []permissionResource {
+	resources := []permissionResource{}
+	for _, row := range dashboards.Rows {
+		kind, _, _ := strings.Cut(permissionScope(dashboards, row), ":uid:")
+		resources = append(resources, permissionResource{strconv.FormatInt(rowOrg(dashboards, row), 10), cell(dashboards, row, "uid"), kind})
+	}
+	for _, row := range libraries.Rows {
+		resources = append(resources, permissionResource{strconv.FormatInt(rowOrg(libraries, row), 10), cell(libraries, row, "uid"), "library.panels"})
+	}
+	return resources
+}
+
 var permissionAction = regexp.MustCompile(`^(dashboards(\.permissions)?|folders(\.permissions)?|library\.panels|alert\.rules|alert\.silences|annotations):[a-z]+$`)
 
 func (s *Snapshot) validateDashboardPermissions() error {
 	resources := make(map[string]bool)
-	for _, row := range s.Dashboard.Rows {
-		resources[cell(s.Dashboard, row, "org_id")+"/"+permissionScope(s.Dashboard, row)] = true
+	for _, r := range permissionResources(s.Dashboard, s.LibraryElement) {
+		resources[r.org+"/"+r.kind+":uid:"+r.uid] = true
 	}
 	seen := make(map[DashboardPermission]bool)
 	for _, p := range s.DashboardPermissions {
@@ -80,20 +94,27 @@ func (d *Database) checkBuiltinBinding(ctx context.Context, tx *sql.Tx, id int64
 }
 
 func (d *Database) readDashboardPermissions(ctx context.Context, tx *sql.Tx, dashboards Table) ([]DashboardPermission, error) {
+	return d.readResourcePermissions(ctx, tx, permissionResources(dashboards, Table{}))
+}
+
+func (d *Database) readResourcePermissions(ctx context.Context, tx *sql.Tx, selected []permissionResource) ([]DashboardPermission, error) {
 	permissions := []DashboardPermission{}
 	checked := make(map[int64]bool)
 	type resource struct{ org, scope string }
 	resources := []resource{}
 	seen := make(map[string]bool)
 	expected := make(map[string]bool)
-	for _, row := range dashboards.Rows {
-		org, uid := strconv.FormatInt(rowOrg(dashboards, row), 10), cell(dashboards, row, "uid")
-		expected[org+"/"+permissionScope(dashboards, row)] = true
-		for _, kind := range []string{"dashboards", "folders"} {
-			scope := kind + ":uid:" + uid
-			if !seen[org+"/"+scope] {
-				resources = append(resources, resource{org, scope})
-				seen[org+"/"+scope] = true
+	for _, r := range selected {
+		expected[r.org+"/"+r.kind+":uid:"+r.uid] = true
+		kinds := []string{"dashboards", "folders"}
+		if r.kind == "library.panels" {
+			kinds = []string{r.kind}
+		}
+		for _, kind := range kinds {
+			scope := kind + ":uid:" + r.uid
+			if !seen[r.org+"/"+scope] {
+				resources = append(resources, resource{r.org, scope})
+				seen[r.org+"/"+scope] = true
 			}
 		}
 	}
@@ -121,7 +142,7 @@ func (d *Database) readDashboardPermissions(ctx context.Context, tx *sql.Tx, das
 			if name == managedRole("Editor") {
 				role = "Editor"
 			}
-			if name != managedRole(role) || !permissionAction.MatchString(action) || !expected[org+"/"+scope] || (storedKind != "dashboards" && storedKind != "folders") || scope != storedKind+":uid:"+identifier || attribute != "uid" {
+			if name != managedRole(role) || !permissionAction.MatchString(action) || !expected[org+"/"+scope] || (storedKind != "dashboards" && storedKind != "folders" && storedKind != "library.panels") || scope != storedKind+":uid:"+identifier || attribute != "uid" {
 				rows.Close()
 				return nil, errors.New("dashboard has unsupported individual, team, custom-role or malformed RBAC permissions; no changes applied")
 			}
@@ -181,7 +202,34 @@ func (d *Database) planDashboardPermissions(ctx context.Context, tx *sql.Tx, s *
 			}
 		}
 	}
-	current, err := d.readDashboardPermissions(ctx, tx, affected)
+	resources := permissionResources(affected, Table{})
+	if s.Version >= 4 {
+		storedLibraries, _, err := d.readSyncTarget(ctx, tx, tableEntry{name: "library_element", key: "id"})
+		if err != nil {
+			return nil, err
+		}
+		libraries := s.LibraryElement
+		libraries.Rows = append([][]*string{}, libraries.Rows...)
+		if mode == ImportInsertOnly {
+			libraries.Rows = nil
+			existing := syncRowsByID(storedLibraries, "id")
+			for _, row := range s.LibraryElement.Rows {
+				id, _ := syncID(row, s.LibraryElement.Columns, "id")
+				if existing[id] == nil {
+					libraries.Rows = append(libraries.Rows, row)
+				}
+			}
+		}
+		if mode == ImportSync {
+			for _, row := range storedLibraries.Rows {
+				if s.scopeIDs()[rowOrg(storedLibraries, row)] {
+					libraries.Rows = append(libraries.Rows, reorderRow(row, storedLibraries.Columns, libraries.Columns))
+				}
+			}
+		}
+		resources = append(resources, permissionResources(Table{}, libraries)...)
+	}
+	current, err := d.readResourcePermissions(ctx, tx, resources)
 	if err != nil {
 		return nil, err
 	}
@@ -190,8 +238,8 @@ func (d *Database) planDashboardPermissions(ctx context.Context, tx *sql.Tx, s *
 	}
 	wanted := make(map[DashboardPermission]bool)
 	allowed := make(map[string]bool)
-	for _, row := range affected.Rows {
-		allowed[cell(affected, row, "org_id")+"/"+permissionScope(affected, row)] = true
+	for _, r := range resources {
+		allowed[r.org+"/"+r.kind+":uid:"+r.uid] = true
 	}
 	for _, p := range s.DashboardPermissions {
 		if mode == ImportInsertOnly && !allowed[p.OrgID+"/"+p.Scope] {

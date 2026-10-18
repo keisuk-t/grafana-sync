@@ -72,7 +72,7 @@ func (s *Snapshot) Selection() Targets {
 }
 
 func (s *Snapshot) ScopeIDs() []string {
-	if s.Version == 3 {
+	if s.Version >= 3 {
 		return s.Scope.OrgIDs
 	}
 	ids := []string{}
@@ -106,6 +106,9 @@ func (s *Snapshot) Select(targets Targets) (*Snapshot, error) {
 	}
 	selected := *s
 	selected.Version, selected.Targets = 3, targets.Names()
+	if s.Version >= 4 {
+		selected.Version = s.Version
+	}
 	selected.Scope = Scope{OrgIDs: append([]string{}, s.ScopeIDs()...)}
 	if !targets.Has(TargetDashboard) {
 		selected.DashboardPermissions = nil

@@ -64,6 +64,17 @@ func (d *Database) prepareDashboardSync(ctx context.Context, tx *sql.Tx, s *Snap
 			return err
 		}
 	}
+	if s.Version < 4 {
+		if err := d.preserveLegacyLibraries(ctx, tx, s, final); err != nil {
+			return err
+		}
+		for _, name := range []string{"library_element", "library_element_connection"} {
+			targets[name] = final[name]
+		}
+	}
+	if err := protectLibrarySync(s, plans, targets); err != nil {
+		return err
+	}
 	return d.validateDashboardOutcome(ctx, tx, s, final)
 }
 
@@ -71,8 +82,11 @@ func (d *Database) applyDashboardSync(ctx context.Context, tx *sql.Tx, plans map
 	if plans["dashboard"] == nil {
 		return nil
 	}
-	for _, name := range []string{"dashboard_tag", "dashboard_version"} {
+	for _, name := range []string{"library_element_connection", "dashboard_tag", "dashboard_version"} {
 		plan := plans[name]
+		if plan == nil {
+			continue
+		}
 		replacement := *plan
 		replacement.remove = append([]int64{}, plan.remove...)
 		for _, row := range plan.update {
@@ -83,12 +97,18 @@ func (d *Database) applyDashboardSync(ctx context.Context, tx *sql.Tx, plans map
 			return err
 		}
 	}
-	for _, name := range []string{"dashboard", "folder"} {
+	for _, name := range []string{"library_element", "dashboard", "folder"} {
+		if plans[name] == nil {
+			continue
+		}
 		if err := d.syncDelete(ctx, tx, plans[name]); err != nil {
 			return err
 		}
 	}
-	for _, name := range []string{"folder", "dashboard"} {
+	for _, name := range []string{"folder", "dashboard", "library_element"} {
+		if plans[name] == nil {
+			continue
+		}
 		if err := d.syncUpdate(ctx, tx, plans[name], kinds[name]); err != nil {
 			return err
 		}
@@ -96,7 +116,10 @@ func (d *Database) applyDashboardSync(ctx context.Context, tx *sql.Tx, plans map
 			return err
 		}
 	}
-	for _, name := range []string{"dashboard_tag", "dashboard_version"} {
+	for _, name := range []string{"dashboard_tag", "dashboard_version", "library_element_connection"} {
+		if plans[name] == nil {
+			continue
+		}
 		plan := *plans[name]
 		plan.insert = append(append([][]*string{}, plan.insert...), plan.update...)
 		if err := d.syncInsert(ctx, tx, &plan); err != nil {
@@ -110,7 +133,7 @@ func (d *Database) checkDashboardUnique(ctx context.Context, tx *sql.Tx, s *Snap
 	for _, entry := range []struct {
 		name  string
 		table Table
-	}{{"dashboard", s.Dashboard}, {"folder", s.Folder}} {
+	}{{"dashboard", s.Dashboard}, {"folder", s.Folder}, {"library_element", s.LibraryElement}} {
 		if len(entry.table.Rows) < 2 {
 			continue
 		}

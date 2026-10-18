@@ -70,7 +70,7 @@ func (d *Database) checkStorage(ctx context.Context, targets Targets) error {
 	if d.Engine != "mysql" {
 		return nil
 	}
-	for _, entry := range (&Snapshot{Version: 3, Targets: targets.Names()}).entries() {
+	for _, entry := range (&Snapshot{Version: 4, Targets: targets.Names()}).entries() {
 		name := entry.name
 		var engine string
 		if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil {
@@ -107,7 +107,7 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		return nil, errors.New("cannot begin export transaction")
 	}
 	defer tx.Rollback()
-	s := &Snapshot{Version: 3, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
+	s := &Snapshot{Version: 4, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
 	org, err := d.readTable(ctx, tx, (&Snapshot{Version: 2}).entries()[0])
 	if err != nil {
 		return nil, err
@@ -136,7 +136,7 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		if err := d.guardDashboardDependencies(ctx, tx, s.Dashboard, false); err != nil {
 			return nil, err
 		}
-		s.DashboardPermissions, err = d.readDashboardPermissions(ctx, tx, s.Dashboard)
+		s.DashboardPermissions, err = d.readResourcePermissions(ctx, tx, permissionResources(s.Dashboard, s.LibraryElement))
 		if err != nil {
 			return nil, err
 		}

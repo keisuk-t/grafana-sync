@@ -24,16 +24,18 @@ func createDashboardFixtures(t *testing.T, ctx context.Context, db *Database) {
 		id, stamp, boolean, suffix = "BIGINT PRIMARY KEY AUTO_INCREMENT", "DATETIME(6)", "TINYINT(1)", " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 	}
 	definitions := map[string]string{
-		"dashboard":         "id " + id + ", org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL, title VARCHAR(255) NOT NULL, data TEXT NOT NULL, version BIGINT NOT NULL, is_folder " + boolean + " NOT NULL, folder_id BIGINT NOT NULL, folder_uid VARCHAR(40), has_acl " + boolean + " NOT NULL, is_public " + boolean + " NOT NULL, UNIQUE(org_id,uid), UNIQUE(org_id,folder_uid,title)",
-		"folder":            "id " + id + ", org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL, title VARCHAR(255) NOT NULL, parent_uid VARCHAR(40), UNIQUE(org_id,uid), UNIQUE(org_id,parent_uid,title)",
-		"dashboard_tag":     "id " + id + ", dashboard_id BIGINT NOT NULL, term VARCHAR(50) NOT NULL, org_id BIGINT, dashboard_uid VARCHAR(40), UNIQUE(dashboard_id,term), FOREIGN KEY(dashboard_id) REFERENCES dashboard(id)",
-		"dashboard_version": "id " + id + ", dashboard_id BIGINT NOT NULL, version BIGINT NOT NULL, data TEXT NOT NULL, UNIQUE(dashboard_id,version), FOREIGN KEY(dashboard_id) REFERENCES dashboard(id)",
-		"role":              "id " + id + ", name VARCHAR(190) NOT NULL, version BIGINT NOT NULL, org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL UNIQUE, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name)",
-		"builtin_role":      "id " + id + ", role_id BIGINT NOT NULL, " + db.quote("role") + " VARCHAR(190) NOT NULL, org_id BIGINT NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
-		"permission":        "id " + id + ", role_id BIGINT NOT NULL, action VARCHAR(190) NOT NULL, scope VARCHAR(190) NOT NULL, kind VARCHAR(40) NOT NULL, attribute VARCHAR(40) NOT NULL, identifier VARCHAR(40) NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(role_id,action,scope), FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
-		"kv_store":          "id " + id + ", namespace VARCHAR(190), " + db.quote("key") + " VARCHAR(190), " + db.quote("value") + " TEXT",
+		"dashboard":                  "id " + id + ", org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL, title VARCHAR(255) NOT NULL, data TEXT NOT NULL, version BIGINT NOT NULL, is_folder " + boolean + " NOT NULL, folder_id BIGINT NOT NULL, folder_uid VARCHAR(40), has_acl " + boolean + " NOT NULL, is_public " + boolean + " NOT NULL, UNIQUE(org_id,uid), UNIQUE(org_id,folder_uid,title)",
+		"folder":                     "id " + id + ", org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL, title VARCHAR(255) NOT NULL, parent_uid VARCHAR(40), UNIQUE(org_id,uid), UNIQUE(org_id,parent_uid,title)",
+		"dashboard_tag":              "id " + id + ", dashboard_id BIGINT NOT NULL, term VARCHAR(50) NOT NULL, org_id BIGINT, dashboard_uid VARCHAR(40), UNIQUE(dashboard_id,term), FOREIGN KEY(dashboard_id) REFERENCES dashboard(id)",
+		"dashboard_version":          "id " + id + ", dashboard_id BIGINT NOT NULL, version BIGINT NOT NULL, data TEXT NOT NULL, UNIQUE(dashboard_id,version), FOREIGN KEY(dashboard_id) REFERENCES dashboard(id)",
+		"library_element":            "id " + id + ", org_id BIGINT NOT NULL, folder_id BIGINT NOT NULL, folder_uid VARCHAR(40), uid VARCHAR(40) NOT NULL, name VARCHAR(150) NOT NULL, kind BIGINT NOT NULL, type VARCHAR(40) NOT NULL, model TEXT NOT NULL, version BIGINT NOT NULL, UNIQUE(org_id,uid), UNIQUE(org_id,folder_uid,name,kind)",
+		"library_element_connection": "id " + id + ", element_id BIGINT NOT NULL, kind BIGINT NOT NULL, connection_id BIGINT NOT NULL, UNIQUE(element_id,kind,connection_id), FOREIGN KEY(element_id) REFERENCES library_element(id), FOREIGN KEY(connection_id) REFERENCES dashboard(id)",
+		"role":                       "id " + id + ", name VARCHAR(190) NOT NULL, version BIGINT NOT NULL, org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL UNIQUE, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name)",
+		"builtin_role":               "id " + id + ", role_id BIGINT NOT NULL, " + db.quote("role") + " VARCHAR(190) NOT NULL, org_id BIGINT NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
+		"permission":                 "id " + id + ", role_id BIGINT NOT NULL, action VARCHAR(190) NOT NULL, scope VARCHAR(190) NOT NULL, kind VARCHAR(40) NOT NULL, attribute VARCHAR(40) NOT NULL, identifier VARCHAR(40) NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(role_id,action,scope), FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
+		"kv_store":                   "id " + id + ", namespace VARCHAR(190), " + db.quote("key") + " VARCHAR(190), " + db.quote("value") + " TEXT",
 	}
-	for _, name := range []string{"dashboard", "folder", "dashboard_tag", "dashboard_version", "role", "builtin_role", "permission", "kv_store"} {
+	for _, name := range []string{"dashboard", "folder", "library_element", "library_element_connection", "dashboard_tag", "dashboard_version", "role", "builtin_role", "permission", "kv_store"} {
 		if _, err := db.DB.ExecContext(ctx, "CREATE TABLE "+db.quote(name)+" ("+definitions[name]+")"+suffix); err != nil {
 			t.Fatal(name, err)
 		}
@@ -49,7 +51,7 @@ func createDashboardFixtures(t *testing.T, ctx context.Context, db *Database) {
 
 func clearDashboardFixtures(t *testing.T, ctx context.Context, db *Database) {
 	t.Helper()
-	for _, name := range []string{"permission", "builtin_role", "role", "dashboard_tag", "dashboard_version", "dashboard", "folder", "secrets", "data_source", "data_keys", "org", "kv_store"} {
+	for _, name := range []string{"permission", "builtin_role", "role", "library_element_connection", "library_element", "dashboard_tag", "dashboard_version", "dashboard", "folder", "secrets", "data_source", "data_keys", "org", "kv_store"} {
 		if _, err := db.DB.ExecContext(ctx, "DELETE FROM "+db.quote(name)); err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +86,7 @@ func dashboardDatabaseState(t *testing.T, ctx context.Context, db *Database) str
 	}
 	defer tx.Rollback()
 	state := map[string]Table{}
-	for _, entry := range (&Snapshot{Version: 3, Targets: AllTargets.Names()}).entries() {
+	for _, entry := range (&Snapshot{Version: 4, Targets: AllTargets.Names()}).entries() {
 		table, _, err := db.readSyncTarget(ctx, tx, entry)
 		if err != nil {
 			t.Fatal(err)
@@ -99,7 +101,7 @@ func dashboardDatabaseState(t *testing.T, ctx context.Context, db *Database) str
 		state[name] = table
 	}
 	if db.Engine == "postgres" {
-		for _, name := range []string{"org", "data_source", "secrets", "dashboard", "folder", "dashboard_tag", "dashboard_version", "role", "builtin_role", "permission"} {
+		for _, name := range []string{"org", "data_source", "secrets", "dashboard", "folder", "dashboard_tag", "dashboard_version", "library_element", "library_element_connection", "role", "builtin_role", "permission"} {
 			table, err := db.readTable(ctx, tx, tableEntry{name: name + "_id_seq", key: "last_value"})
 			if err != nil {
 				t.Fatal(err)
@@ -554,13 +556,11 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		{"dashboard_acl", "dashboard_id BIGINT", "12", true},
 		{"dashboard_provisioning", "dashboard_id BIGINT", "12", true},
 		{"dashboard_public", "dashboard_uid VARCHAR(40), org_id BIGINT, access_token VARCHAR(40), is_enabled BIGINT", "'board',9007199254740993,'test-only-public-token',1", false},
-		{"library_element_connection", "connection_id BIGINT", "12", true},
 		{"star", "dashboard_id BIGINT", "12", false},
 		{"playlist_item", "value VARCHAR(40), type VARCHAR(40)", "'board','dashboard_by_uid'", false},
 		{"annotation", "dashboard_id BIGINT,dashboard_uid VARCHAR(40),org_id BIGINT", "12,'board',9007199254740993", false},
 		{"alert", "dashboard_id BIGINT,org_id BIGINT", "12,9007199254740993", false},
 		{"alert_rule", "dashboard_uid VARCHAR(40),namespace_uid VARCHAR(40),org_id BIGINT", "NULL,'root',9007199254740993", false},
-		{"library_element", "folder_id BIGINT,folder_uid VARCHAR(40),org_id BIGINT", "10,'root',9007199254740993", false},
 	} {
 		if _, err := db.DB.ExecContext(ctx, "CREATE TABLE "+db.quote(spec.name)+" ("+spec.columns+")"); err != nil {
 			t.Fatal(err)
@@ -640,6 +640,32 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		if _, err := db.DB.ExecContext(ctx, "DELETE FROM kv_store"); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := db.DB.ExecContext(ctx, "CREATE TABLE "+db.quote("resource")+" ("+db.quote("group")+" VARCHAR(190), "+db.quote("resource")+" VARCHAR(190))"); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range [][2]string{{"other.grafana.app", "dashboards"}, {"dashboard.grafana.app", "dashboards"}, {"folder.grafana.app", "folders"}} {
+		if _, err := db.DB.ExecContext(ctx, "DELETE FROM "+db.quote("resource")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.DB.ExecContext(ctx, "INSERT INTO "+db.quote("resource")+" ("+db.quote("group")+", "+db.quote("resource")+") VALUES ("+db.bind(1)+", "+db.bind(2)+")", row[0], row[1]); err != nil {
+			t.Fatal(err)
+		}
+		_, err := db.ExportTargets(ctx, TargetDashboard)
+		if row[0] == "other.grafana.app" && err != nil || row[0] != "other.grafana.app" && err == nil {
+			t.Fatal("incorrect handling of Unified Storage resources", row, err)
+		}
+		if row[0] != "other.grafana.app" {
+			if _, err := db.Sync(ctx, s, SyncOptions{DryRun: true}); err == nil {
+				t.Fatal("sync ignored Unified Storage resources")
+			}
+			if _, err := db.Export(ctx); err != nil {
+				t.Fatal("default selection inspected dashboard storage", err)
+			}
+		}
+	}
+	if _, err := db.DB.ExecContext(ctx, "DROP TABLE "+db.quote("resource")); err != nil {
+		t.Fatal(err)
 	}
 	// Builtin IDs are never copied; custom/user/team roles are never accepted.
 	for _, name := range []string{"managed:users:1:permissions", "managed:teams:1:permissions", "custom-role", "global-custom-role"} {

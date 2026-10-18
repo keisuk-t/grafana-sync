@@ -108,6 +108,10 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 			result.DashboardTag = plan.count
 		case "dashboard_version":
 			result.DashboardVersion = plan.count
+		case "library_element":
+			result.LibraryElement = plan.count
+		case "library_element_connection":
+			result.LibraryConnection = plan.count
 		}
 		result.Inserted += plan.count.Inserted
 		result.Updated += plan.count.Updated
@@ -605,6 +609,9 @@ func (d *Database) syncUpdate(ctx context.Context, tx *sql.Tx, plan *syncTablePl
 				if cell(*entry.table, row, parent) != cell(Table{Columns: plan.targetColumns}, old, parent) {
 					equal = false
 				}
+			}
+			if col == "name" && entry.name == "library_element" && cell(*entry.table, row, "folder_uid") != cell(Table{Columns: plan.targetColumns}, old, "folder_uid") {
+				equal = false
 			}
 			if !equal || orgID != oldOrgID {
 				temp, err := temporaryKey()

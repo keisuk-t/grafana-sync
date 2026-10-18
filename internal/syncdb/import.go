@@ -39,6 +39,8 @@ type ImportResult struct {
 	Folder               TableResult
 	DashboardTag         TableResult
 	DashboardVersion     TableResult
+	LibraryElement       TableResult
+	LibraryConnection    TableResult
 	DashboardPermissions TableResult
 }
 

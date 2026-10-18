@@ -27,7 +27,22 @@ func (d *Database) tableExists(ctx context.Context, tx *sql.Tx, name string) (bo
 }
 
 func (d *Database) checkDashboardStorage(ctx context.Context, tx *sql.Tx) error {
-	exists, err := d.tableExists(ctx, tx, "kv_store")
+	exists, err := d.tableExists(ctx, tx, "resource")
+	if err != nil {
+		return err
+	}
+	if exists {
+		var found int
+		query := "SELECT 1 FROM " + d.quote("resource") + " WHERE (" + d.quote("group") + " = 'dashboard.grafana.app' AND " + d.quote("resource") + " = 'dashboards') OR (" + d.quote("group") + " = 'folder.grafana.app' AND " + d.quote("resource") + " = 'folders') LIMIT 1"
+		err := tx.QueryRowContext(ctx, query).Scan(&found)
+		if err == nil {
+			return errors.New("dashboard transfer requires legacy SQL storage only; Unified Storage contains dashboards or folders")
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return errors.New("cannot inspect Unified Storage resources")
+		}
+	}
+	exists, err = d.tableExists(ctx, tx, "kv_store")
 	if err != nil || !exists {
 		return err
 	}
@@ -72,9 +87,6 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 		{"dashboard_acl", "dashboard_id", "", "", "", false},
 		{"dashboard_provisioning", "dashboard_id", "", "", "", false},
 		{"dashboard_public", "", "dashboard_uid", "org_id", "", true},
-		{"library_element_connection", "connection_id", "", "", "", false},
-		{"library_element", "folder_id", "", "org_id", "", true},
-		{"library_element", "", "folder_uid", "org_id", "", true},
 		{"star", "dashboard_id", "", "", "", true},
 		{"playlist_item", "value", "", "", "type = 'dashboard_by_id'", true},
 		{"playlist_item", "", "value", "", "type = 'dashboard_by_uid'", true},

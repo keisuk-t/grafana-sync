@@ -30,6 +30,8 @@ type Snapshot struct {
 	Folder               Table                 `json:"-"`
 	DashboardTag         Table                 `json:"-"`
 	DashboardVersion     Table                 `json:"-"`
+	LibraryElement       Table                 `json:"-"`
+	LibraryConnection    Table                 `json:"-"`
 	Targets              []string              `json:"-"`
 	Scope                Scope                 `json:"-"`
 	DashboardPermissions []DashboardPermission `json:"-"`
@@ -48,16 +50,24 @@ type tableEntry struct {
 }
 
 func (s *Snapshot) allEntries() []tableEntry {
-	return []tableEntry{
+	entries := []tableEntry{
 		{"org", "id", true, &s.Org, TargetOrg},
 		{"data_keys", "name", false, &s.DataKeys, TargetDatasource},
 		{"data_source", "id", true, &s.DataSource, TargetDatasource},
 		{"secrets", "id", true, &s.Secrets, TargetDatasource},
 		{"folder", "id", true, &s.Folder, TargetDashboard},
 		{"dashboard", "id", true, &s.Dashboard, TargetDashboard},
-		{"dashboard_tag", "id", true, &s.DashboardTag, TargetDashboard},
-		{"dashboard_version", "id", true, &s.DashboardVersion, TargetDashboard},
 	}
+	if s.Version >= 4 {
+		entries = append(entries,
+			tableEntry{"library_element", "id", true, &s.LibraryElement, TargetDashboard},
+			tableEntry{"library_element_connection", "id", true, &s.LibraryConnection, TargetDashboard},
+		)
+	}
+	return append(entries,
+		tableEntry{"dashboard_tag", "id", true, &s.DashboardTag, TargetDashboard},
+		tableEntry{"dashboard_version", "id", true, &s.DashboardVersion, TargetDashboard},
+	)
 }
 
 func (s *Snapshot) entries() []tableEntry {
@@ -71,7 +81,7 @@ func (s *Snapshot) entries() []tableEntry {
 }
 
 func (s Snapshot) MarshalJSON() ([]byte, error) {
-	if s.Version != 3 {
+	if s.Version == 2 {
 		type legacy struct {
 			Version    int   `json:"version"`
 			Org        Table `json:"org"`
@@ -139,16 +149,16 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-	if wire.Version != 3 {
-		return errors.New("unsupported snapshot version (expected 2 or 3)")
+	if wire.Version != 3 && wire.Version != 4 {
+		return errors.New("unsupported snapshot version (expected 2, 3 or 4)")
 	}
 	for _, name := range []string{"org", "data_source", "data_keys", "secrets"} {
 		if _, ok := fields[name]; ok {
-			return errors.New("version 3 cannot declare legacy table fields")
+			return errors.New("version 3/4 cannot declare legacy table fields")
 		}
 	}
 	if wire.Scope == nil || wire.Tables == nil || wire.Org != nil || wire.DataSource != nil || wire.DataKeys != nil || wire.Secrets != nil {
-		return errors.New("version 3 requires targets, scope and tables only")
+		return errors.New("version 3/4 requires targets, scope and tables only")
 	}
 	s.Targets, s.Scope = wire.Targets, *wire.Scope
 	targets, err := ParseTargets(strings.Join(s.Targets, ","))
@@ -226,13 +236,13 @@ func Decode(r io.Reader) (*Snapshot, error) {
 }
 
 func (s *Snapshot) Validate() error {
-	if s == nil || (s.Version != 2 && s.Version != 3) {
-		return errors.New("unsupported snapshot version (expected 2 or 3; re-export to include encryption tables)")
+	if s == nil || (s.Version != 2 && s.Version != 3 && s.Version != 4) {
+		return errors.New("unsupported snapshot version (expected 2, 3 or 4; re-export to include encryption tables)")
 	}
 	if err := s.Selection().Validate(); err != nil {
 		return err
 	}
-	if s.Version == 3 && len(s.Targets) != len(s.Selection().Names()) {
+	if s.Version >= 3 && len(s.Targets) != len(s.Selection().Names()) {
 		return errors.New("targets must list individual resource names")
 	}
 	for _, entry := range s.entries() {
@@ -241,7 +251,7 @@ func (s *Snapshot) Validate() error {
 		}
 	}
 	orgIDs := s.scopeIDs()
-	if s.Version == 3 {
+	if s.Version >= 3 {
 		if s.Scope.OrgIDs == nil {
 			return errors.New("scope requires an org_ids array")
 		}
