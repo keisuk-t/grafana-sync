@@ -60,7 +60,7 @@ func (d *Database) prepareDashboardSync(ctx context.Context, tx *sql.Tx, s *Snap
 				identity.Rows = append(identity.Rows, old)
 			}
 		}
-		if err := d.guardDashboardDependencies(ctx, tx, identity, true); err != nil {
+		if err := d.guardDashboardDependenciesWithRBAC(ctx, tx, identity, true, s.Version >= 5); err != nil {
 			return err
 		}
 	}

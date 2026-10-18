@@ -17,8 +17,9 @@ import (
 )
 
 type SyncOptions struct {
-	DryRun      bool
-	AllowDelete bool
+	DryRun       bool
+	AllowDelete  bool
+	PrincipalMap *PrincipalMap
 }
 
 type syncTablePlan struct {
@@ -32,6 +33,11 @@ type syncTablePlan struct {
 }
 
 func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (ImportResult, error) {
+	if s != nil {
+		copy := *s
+		copy.principalMap = options.PrincipalMap
+		s = &copy
+	}
 	if !options.DryRun && !options.AllowDelete {
 		return ImportResult{}, errors.New("sync requires --allow-delete or --dry-run")
 	}
@@ -120,8 +126,12 @@ func (d *Database) Sync(ctx context.Context, s *Snapshot, options SyncOptions) (
 		result.Skipped += plan.count.Skipped
 	}
 	addPermissionCounts(&result, permissions.count)
+	addRBACCounts(&result, permissions.rbac)
 	if options.DryRun {
 		return result, nil
+	}
+	if err := d.applyRBACDeletes(ctx, tx, permissions.rbac); err != nil {
+		return ImportResult{}, err
 	}
 	byName := make(map[string]*syncTablePlan)
 	for _, plan := range plans {

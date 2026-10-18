@@ -35,6 +35,8 @@ type Snapshot struct {
 	Targets              []string              `json:"-"`
 	Scope                Scope                 `json:"-"`
 	DashboardPermissions []DashboardPermission `json:"-"`
+	RBAC                 *ResourceRBAC         `json:"-"`
+	principalMap         *PrincipalMap
 }
 
 type Scope struct {
@@ -101,7 +103,8 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		Scope                Scope                  `json:"scope"`
 		Tables               map[string]Table       `json:"tables"`
 		DashboardPermissions *[]DashboardPermission `json:"dashboard_permissions,omitempty"`
-	}{s.Version, s.Targets, s.Scope, tables, s.permissionEnvelope()})
+		RBAC                 *ResourceRBAC          `json:"rbac,omitempty"`
+	}{s.Version, s.Targets, s.Scope, tables, s.permissionEnvelope(), s.RBAC})
 }
 
 func (s *Snapshot) UnmarshalJSON(data []byte) error {
@@ -118,6 +121,7 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		DataKeys             *Table                 `json:"data_keys"`
 		Secrets              *Table                 `json:"secrets"`
 		DashboardPermissions *[]DashboardPermission `json:"dashboard_permissions"`
+		RBAC                 *ResourceRBAC          `json:"rbac"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -130,7 +134,7 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 	}
 	*s = Snapshot{Version: wire.Version}
 	if wire.Version == 2 {
-		for _, name := range []string{"targets", "scope", "tables", "dashboard_permissions"} {
+		for _, name := range []string{"targets", "scope", "tables", "dashboard_permissions", "rbac"} {
 			if _, ok := fields[name]; ok {
 				return errors.New("version 2 cannot declare version 3 fields")
 			}
@@ -149,8 +153,8 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	}
-	if wire.Version != 3 && wire.Version != 4 {
-		return errors.New("unsupported snapshot version (expected 2, 3 or 4)")
+	if wire.Version != 3 && wire.Version != 4 && wire.Version != 5 {
+		return errors.New("unsupported snapshot version (expected 2, 3, 4 or 5)")
 	}
 	for _, name := range []string{"org", "data_source", "data_keys", "secrets"} {
 		if _, ok := fields[name]; ok {
@@ -165,7 +169,7 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if targets.Has(TargetDashboard) != (wire.DashboardPermissions != nil) {
+	if wire.Version < 5 && targets.Has(TargetDashboard) != (wire.DashboardPermissions != nil) {
 		return errors.New("dashboard target requires an explicit dashboard_permissions array")
 	}
 	if _, ok := fields["dashboard_permissions"]; ok && !targets.Has(TargetDashboard) {
@@ -174,6 +178,16 @@ func (s *Snapshot) UnmarshalJSON(data []byte) error {
 	if wire.DashboardPermissions != nil {
 		s.DashboardPermissions = *wire.DashboardPermissions
 	}
+	if wire.Version == 5 && targets.Has(TargetDashboard) != (wire.RBAC != nil) {
+		return errors.New("version 5 dashboard target requires an explicit rbac envelope")
+	}
+	if _, ok := fields["rbac"]; ok && (wire.Version < 5 || !targets.Has(TargetDashboard)) {
+		return errors.New("unselected or legacy snapshot cannot declare rbac")
+	}
+	if _, ok := fields["dashboard_permissions"]; ok && wire.Version == 5 {
+		return errors.New("version 5 uses rbac instead of dashboard_permissions")
+	}
+	s.RBAC = wire.RBAC
 	for _, entry := range s.allEntries() {
 		table, ok := wire.Tables[entry.name]
 		if targets.Has(entry.group) != ok {
@@ -236,7 +250,7 @@ func Decode(r io.Reader) (*Snapshot, error) {
 }
 
 func (s *Snapshot) Validate() error {
-	if s == nil || (s.Version != 2 && s.Version != 3 && s.Version != 4) {
+	if s == nil || (s.Version != 2 && s.Version != 3 && s.Version != 4 && s.Version != 5) {
 		return errors.New("unsupported snapshot version (expected 2, 3 or 4; re-export to include encryption tables)")
 	}
 	if err := s.Selection().Validate(); err != nil {
@@ -280,6 +294,9 @@ func (s *Snapshot) Validate() error {
 		if err := s.validateDashboards(orgIDs); err != nil {
 			return err
 		}
+	}
+	if err := s.validateRBAC(); err != nil {
+		return err
 	}
 	if !s.Selection().Has(TargetDatasource) {
 		return nil

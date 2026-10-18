@@ -72,6 +72,24 @@ func TestImportValidatesBeforeConnecting(t *testing.T) {
 	}
 }
 
+func TestPrincipalMapFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := os.WriteFile(path, []byte(`{"version":5,"targets":["org"],"scope":{"org_ids":[]},"tables":{"org":{"columns":["id","name"],"rows":[]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mapping := filepath.Join(t.TempDir(), "principals.json")
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	for _, data := range []string{`{"version":2,"mappings":[]}`, `{"version":1,"mappings":[{"org_id":"1","kind":"user","source_id":1,"target_id":"2","target_uid":"uid"}]}`, `{"password":"must-not-be-logged"}`} {
+		if err := os.WriteFile(mapping, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", path, "--targets", "org", "--principal-map", mapping}, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "principal map") || strings.Contains(err.Error(), "must-not-be-logged") {
+			t.Fatal("invalid principal map was not safely rejected before connecting", err)
+		}
+	}
+}
+
 func TestImportModeFlag(t *testing.T) {
 	t.Setenv("GRAFANA_SYNC_DSN", "")
 	for _, mode := range []string{"require-empty", "insert-only"} {

@@ -5,8 +5,10 @@ package syncdb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,7 +32,7 @@ func createDashboardFixtures(t *testing.T, ctx context.Context, db *Database) {
 		"dashboard_version":          "id " + id + ", dashboard_id BIGINT NOT NULL, version BIGINT NOT NULL, data TEXT NOT NULL, UNIQUE(dashboard_id,version), FOREIGN KEY(dashboard_id) REFERENCES dashboard(id)",
 		"library_element":            "id " + id + ", org_id BIGINT NOT NULL, folder_id BIGINT NOT NULL, folder_uid VARCHAR(40), uid VARCHAR(40) NOT NULL, name VARCHAR(150) NOT NULL, kind BIGINT NOT NULL, type VARCHAR(40) NOT NULL, model TEXT NOT NULL, version BIGINT NOT NULL, UNIQUE(org_id,uid), UNIQUE(org_id,folder_uid,name,kind)",
 		"library_element_connection": "id " + id + ", element_id BIGINT NOT NULL, kind BIGINT NOT NULL, connection_id BIGINT NOT NULL, UNIQUE(element_id,kind,connection_id), FOREIGN KEY(element_id) REFERENCES library_element(id), FOREIGN KEY(connection_id) REFERENCES dashboard(id)",
-		"role":                       "id " + id + ", name VARCHAR(190) NOT NULL, version BIGINT NOT NULL, org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL UNIQUE, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name)",
+		"role":                       "id " + id + ", name VARCHAR(190) NOT NULL, version BIGINT NOT NULL, org_id BIGINT NOT NULL, uid VARCHAR(40) NOT NULL UNIQUE, description VARCHAR(255) NOT NULL DEFAULT '', display_name VARCHAR(190) NOT NULL DEFAULT '', group_name VARCHAR(190) NOT NULL DEFAULT '', hidden " + boolean + " NOT NULL DEFAULT FALSE, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(org_id,name)",
 		"builtin_role":               "id " + id + ", role_id BIGINT NOT NULL, " + db.quote("role") + " VARCHAR(190) NOT NULL, org_id BIGINT NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
 		"permission":                 "id " + id + ", role_id BIGINT NOT NULL, action VARCHAR(190) NOT NULL, scope VARCHAR(190) NOT NULL, kind VARCHAR(40) NOT NULL, attribute VARCHAR(40) NOT NULL, identifier VARCHAR(40) NOT NULL, created " + stamp + " NOT NULL, updated " + stamp + " NOT NULL, UNIQUE(role_id,action,scope), FOREIGN KEY(role_id) REFERENCES " + db.quote("role") + "(id)",
 		"kv_store":                   "id " + id + ", namespace VARCHAR(190), " + db.quote("key") + " VARCHAR(190), " + db.quote("value") + " TEXT",
@@ -58,6 +60,33 @@ func clearDashboardFixtures(t *testing.T, ctx context.Context, db *Database) {
 	}
 }
 
+func (db *Database) exportLegacyTargets(ctx context.Context, targets Targets) (*Snapshot, error) {
+	s, err := db.ExportTargets(ctx, targets)
+	if err != nil {
+		return nil, err
+	}
+	s.Version = 4
+	if s.RBAC != nil {
+		roles := map[string]RBACRole{}
+		for _, r := range s.RBAC.Roles {
+			roles[r.Ref] = r
+		}
+		s.DashboardPermissions = []DashboardPermission{}
+		for _, g := range s.RBAC.Grants {
+			if roles[g.Role].Kind != "builtin" {
+				return nil, errors.New("unsupported individual, team, custom-role")
+			}
+			g.Role = builtinName(roles[g.Role].Name)
+			s.DashboardPermissions = append(s.DashboardPermissions, g)
+		}
+		slices.SortFunc(s.DashboardPermissions, func(a, b DashboardPermission) int {
+			return strings.Compare(a.OrgID+"/"+a.Scope+"/"+a.Role+"/"+a.Action, b.OrgID+"/"+b.Scope+"/"+b.Role+"/"+b.Action)
+		})
+		s.RBAC = nil
+	}
+	return s, nil
+}
+
 func seedDashboardFixtures(t *testing.T, ctx context.Context, db *Database) *Snapshot {
 	t.Helper()
 	seedFixtures(t, ctx, db)
@@ -71,7 +100,7 @@ func seedDashboardFixtures(t *testing.T, ctx context.Context, db *Database) *Sna
 	if err := db.Import(ctx, s); err != nil {
 		t.Fatal(err)
 	}
-	all, err := db.ExportTargets(ctx, AllTargets)
+	all, err := db.exportLegacyTargets(ctx, AllTargets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +220,7 @@ func TestDashboardTransfer(t *testing.T) {
 						} else if _, err := db.ImportWithMode(ctx, s, mode); err != nil {
 							t.Fatal(err)
 						}
-						got, err := db.ExportTargets(ctx, AllTargets)
+						got, err := db.exportLegacyTargets(ctx, AllTargets)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -251,7 +280,7 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 		t.Fatal(err)
 	}
 	started := time.Now()
-	got, err := db.ExportTargets(ctx, AllTargets)
+	got, err := db.exportLegacyTargets(ctx, AllTargets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +308,7 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_provisioning VALUES (3999)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported dependencies in dashboard_provisioning") {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported dependencies in dashboard_provisioning") {
 		t.Fatal("last dependency batch was not checked", err)
 	}
 	if _, err := db.DB.ExecContext(ctx, "DROP TABLE dashboard_provisioning"); err != nil {
@@ -288,7 +317,7 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 	if _, err := db.DB.ExecContext(ctx, "CREATE TABLE dashboard_provisioning (unexpected BIGINT)"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.ExportTargets(ctx, TargetDashboard)
+	_, err = db.exportLegacyTargets(ctx, TargetDashboard)
 	if err == nil || !strings.Contains(err.Error(), "expected dependency column is missing") || !strings.Contains(err.Error(), "dashboard_provisioning") {
 		t.Fatal("missing column diagnostic is not actionable", err)
 	}
@@ -301,7 +330,7 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_public VALUES ('batch-2999', 77)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err != nil {
 		t.Fatal("batched query matched another organization's UID", err)
 	}
 	checkDependencies := func() error {
@@ -318,7 +347,7 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_public VALUES ('batch-2999', "+db.bind(1)+")", org); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err != nil {
 		t.Fatal("export rejected excluded public sharing settings", err)
 	}
 	err = checkDependencies()
@@ -334,13 +363,13 @@ func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, sourc
 	if _, err := db.DB.ExecContext(ctx, "INSERT INTO permission (role_id, action, scope, kind, attribute, identifier, created, updated) SELECT id, 'dashboards:read', 'dashboards:uid:batch-2999', 'dashboards', 'uid', 'batch-2999', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM "+db.quote("role")+" WHERE name = 'batch-custom-role'"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err != nil {
 		t.Fatal("batched permissions matched another organization's UID", err)
 	}
 	if _, err := db.DB.ExecContext(ctx, "UPDATE "+db.quote("role")+" SET org_id = "+db.bind(1)+" WHERE name = 'batch-custom-role'", org); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported individual, team, custom-role or malformed RBAC") {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported individual, team, custom-role") {
 		t.Fatal("last permission batch was not checked", err)
 	}
 	if _, err := db.DB.ExecContext(ctx, "DELETE FROM permission WHERE role_id IN (SELECT id FROM "+db.quote("role")+" WHERE name = 'batch-custom-role')"); err != nil {
@@ -384,7 +413,7 @@ func testDashboardSync(t *testing.T, ctx context.Context, db *Database, source *
 	if _, err := db.ImportWithMode(ctx, protected, ImportInsertOnly); err != nil {
 		t.Fatal(err)
 	}
-	allBefore, err := db.ExportTargets(ctx, AllTargets)
+	allBefore, err := db.exportLegacyTargets(ctx, AllTargets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,7 +479,7 @@ func testDashboardSync(t *testing.T, ctx context.Context, db *Database, source *
 	if _, err := db.Sync(ctx, s, SyncOptions{AllowDelete: true}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.ExportTargets(ctx, TargetDashboard)
+	got, err := db.exportLegacyTargets(ctx, TargetDashboard)
 	if err != nil || !reflect.DeepEqual(dashboardOrganization(got, "9007199254740993"), s) {
 		t.Fatal("dashboard recreation or UID swap failed", err)
 	}
@@ -462,11 +491,11 @@ func testDashboardSync(t *testing.T, ctx context.Context, db *Database, source *
 	if _, err := db.Sync(ctx, s, SyncOptions{AllowDelete: true}); err != nil {
 		t.Fatal(err)
 	}
-	got, err = db.ExportTargets(ctx, TargetDashboard)
+	got, err = db.exportLegacyTargets(ctx, TargetDashboard)
 	if err != nil || !reflect.DeepEqual(dashboardOrganization(got, "9007199254740993"), s) {
 		t.Fatal("scoped dashboard deletion failed", err)
 	}
-	allAfter, err := db.ExportTargets(ctx, AllTargets)
+	allAfter, err := db.exportLegacyTargets(ctx, AllTargets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,11 +598,11 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 			t.Fatal(err)
 		}
 		if spec.exportReject {
-			if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
+			if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil {
 				t.Errorf("export ignored %s dependency", spec.name)
 			}
 		} else {
-			if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+			if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err != nil {
 				t.Errorf("export rejected excluded %s settings: %v", spec.name, err)
 			}
 		}
@@ -581,7 +610,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard SET is_public = TRUE WHERE id = 12"); err != nil {
 				t.Fatal(err)
 			}
-			exported, err := db.ExportTargets(ctx, TargetDashboard)
+			exported, err := db.exportLegacyTargets(ctx, TargetDashboard)
 			if err != nil {
 				t.Fatal("export rejected the public metadata flag", err)
 			}
@@ -628,7 +657,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		if _, err := db.DB.ExecContext(ctx, "INSERT INTO kv_store (namespace, "+db.quote("key")+", "+db.quote("value")+") VALUES ('unified.dualwrite','dashboards',"+db.bind(1)+")", status); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
+		if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil {
 			t.Fatal("export accepted Unified Storage or unknown mode")
 		}
 		if _, err := db.Sync(ctx, s, SyncOptions{DryRun: true}); err == nil {
@@ -651,7 +680,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		if _, err := db.DB.ExecContext(ctx, "INSERT INTO "+db.quote("resource")+" ("+db.quote("group")+", "+db.quote("resource")+") VALUES ("+db.bind(1)+", "+db.bind(2)+")", row[0], row[1]); err != nil {
 			t.Fatal(err)
 		}
-		_, err := db.ExportTargets(ctx, TargetDashboard)
+		_, err := db.exportLegacyTargets(ctx, TargetDashboard)
 		if row[0] == "other.grafana.app" && err != nil || row[0] != "other.grafana.app" && err == nil {
 			t.Fatal("incorrect handling of Unified Storage resources", row, err)
 		}
@@ -676,7 +705,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		if _, err := db.DB.ExecContext(ctx, "UPDATE "+db.quote("role")+" SET name = "+db.bind(1)+", org_id = "+db.bind(2)+" WHERE name = "+db.bind(3), name, org, managedRole("Editor")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
+		if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil {
 			t.Fatal("export silently discarded individual RBAC")
 		}
 		if _, err := db.Sync(ctx, s, SyncOptions{AllowDelete: true}); err == nil {
@@ -689,7 +718,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 	if _, err := db.DB.ExecContext(ctx, "DELETE FROM builtin_role"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil {
 		t.Fatal("accepted missing builtin-role binding")
 	}
 }

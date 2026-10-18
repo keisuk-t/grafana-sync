@@ -18,8 +18,9 @@ const usage = `Usage: grafana-sync <export|import> -db <mysql|postgres> -file <s
 
 Transfers --targets org,datasource,dashboard (default: org,datasource).
 Datasource includes data_keys and matching datasource secrets. Dashboard includes
-legacy SQL folders, tags, versions and Viewer/Editor resource permissions.
-Individual/team permissions and Unified Storage are not supported.
+legacy SQL folders, tags, versions and resource RBAC. Version 5 individual/team
+grants require --principal-map and pre-existing matching users and teams.
+Global/shared role differences and Unified Storage are not supported.
 Import defaults to --mode require-empty. Use --mode insert-only to add missing
 primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
@@ -46,8 +47,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	timeout := flags.Duration("timeout", 2*time.Minute, "database operation timeout")
 	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
+	principalMapFile := ""
 	var dryRun, allowDelete bool
 	if command == "import" {
+		flags.StringVar(&principalMapFile, "principal-map", "", "explicit user/team identity mapping JSON (version 1)")
 		flags.StringVar(&modeName, "mode", modeName, "import mode: require-empty, insert-only or sync")
 		flags.BoolVar(&dryRun, "dry-run", false, "show sync changes without writing")
 		flags.BoolVar(&allowDelete, "allow-delete", false, "approve sync changes, including deletion of missing rows")
@@ -82,6 +85,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return errors.New("DSN environment variable is unset or empty")
 	}
 	var snapshot *syncdb.Snapshot
+	var principalMap *syncdb.PrincipalMap
 	if command == "import" {
 		input, err := os.Open(*file)
 		if err != nil {
@@ -96,6 +100,17 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
+		if principalMapFile != "" {
+			input, err := os.Open(principalMapFile)
+			if err != nil {
+				return errors.New("cannot open principal map")
+			}
+			principalMap, err = syncdb.DecodePrincipalMap(input)
+			input.Close()
+			if err != nil {
+				return err
+			}
+		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
@@ -107,9 +122,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if command == "import" {
 		var result syncdb.ImportResult
 		if mode == syncdb.ImportSync {
-			result, err = db.Sync(ctx, snapshot, syncdb.SyncOptions{DryRun: dryRun, AllowDelete: allowDelete})
+			result, err = db.Sync(ctx, snapshot, syncdb.SyncOptions{DryRun: dryRun, AllowDelete: allowDelete, PrincipalMap: principalMap})
 		} else {
-			result, err = db.ImportWithMode(ctx, snapshot, mode)
+			result, err = db.ImportWithOptions(ctx, snapshot, mode, syncdb.ImportOptions{PrincipalMap: principalMap})
 		}
 		if err != nil {
 			return err
@@ -128,7 +143,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			for _, entry := range []struct {
 				name  string
 				count syncdb.TableResult
-			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"library_element", result.LibraryElement}, {"library_element_connection", result.LibraryConnection}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}} {
+			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"library_element", result.LibraryElement}, {"library_element_connection", result.LibraryConnection}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}, {"rbac_roles", result.RBACRoles}, {"rbac_user_assignments", result.RBACUserAssignments}, {"rbac_team_assignments", result.RBACTeamAssignments}, {"rbac_builtin_assignments", result.RBACBuiltinAssignments}, {"dashboard_acl", result.DashboardACL}} {
 				if !tableSelected(entry.name, targets) {
 					continue
 				}
@@ -174,7 +189,11 @@ func printSelection(out io.Writer, s *syncdb.Snapshot) error {
 		if s.Version >= 4 {
 			tables += ",library_element,library_element_connection"
 		}
-		_, err = fmt.Fprintln(out, "dashboard tables: "+tables+"; includes Viewer/Editor permissions; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
+		permissions := "Viewer/Editor permissions"
+		if s.Version >= 5 {
+			permissions = "resource RBAC (explicit principal mapping required for user/team grants)"
+		}
+		_, err = fmt.Fprintln(out, "dashboard tables: "+tables+"; includes "+permissions+"; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
 	}
 	return err
 }

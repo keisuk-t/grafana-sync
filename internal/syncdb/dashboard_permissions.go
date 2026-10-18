@@ -22,7 +22,7 @@ type DashboardPermission struct {
 }
 
 func (s *Snapshot) permissionEnvelope() *[]DashboardPermission {
-	if !s.Selection().Has(TargetDashboard) {
+	if !s.Selection().Has(TargetDashboard) || s.Version >= 5 {
 		return nil
 	}
 	rows := append([]DashboardPermission{}, s.DashboardPermissions...)
@@ -58,6 +58,9 @@ func permissionResources(dashboards, libraries Table) []permissionResource {
 var permissionAction = regexp.MustCompile(`^(dashboards(\.permissions)?|folders(\.permissions)?|library\.panels|alert\.rules|alert\.silences|annotations):[a-z]+$`)
 
 func (s *Snapshot) validateDashboardPermissions() error {
+	if s.Version >= 5 {
+		return nil
+	}
 	resources := make(map[string]bool)
 	for _, r := range permissionResources(s.Dashboard, s.LibraryElement) {
 		resources[r.org+"/"+r.kind+":uid:"+r.uid] = true
@@ -172,12 +175,16 @@ func (d *Database) readResourcePermissions(ctx context.Context, tx *sql.Tx, sele
 type dashboardPermissionPlan struct {
 	insert, remove []DashboardPermission
 	count          TableResult
+	rbac           *rbacPlan
 }
 
 func (d *Database) planDashboardPermissions(ctx context.Context, tx *sql.Tx, s *Snapshot, mode ImportMode) (*dashboardPermissionPlan, error) {
 	plan := &dashboardPermissionPlan{}
 	if !s.Selection().Has(TargetDashboard) {
 		return plan, nil
+	}
+	if s.Version >= 5 {
+		return d.planRBAC(ctx, tx, s, mode)
 	}
 	stored, _, err := d.readSyncTarget(ctx, tx, tableEntry{name: "dashboard", key: "id"})
 	if err != nil {
@@ -323,6 +330,9 @@ func (d *Database) bindList(n int) string {
 }
 
 func (d *Database) applyDashboardPermissions(ctx context.Context, tx *sql.Tx, plan *dashboardPermissionPlan) error {
+	if plan.rbac != nil {
+		return d.applyRBAC(ctx, tx, plan.rbac)
+	}
 	for _, p := range plan.remove {
 		id, err := d.dashboardRole(ctx, tx, p.OrgID, p.Role, false)
 		if err != nil {

@@ -31,7 +31,7 @@ func TestLibraryTransfer(t *testing.T) {
 		if err := db.Import(ctx, s); err != nil {
 			t.Fatal(err)
 		}
-		snapshots[engine], err = db.ExportTargets(ctx, AllTargets)
+		snapshots[engine], err = db.exportLegacyTargets(ctx, AllTargets)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +70,7 @@ func TestLibraryTransfer(t *testing.T) {
 					} else if _, err := db.ImportWithMode(ctx, s, mode); err != nil {
 						t.Fatal(err)
 					}
-					got, err := db.ExportTargets(ctx, AllTargets)
+					got, err := db.exportLegacyTargets(ctx, AllTargets)
 					if err != nil || !reflect.DeepEqual(got, snapshot) {
 						t.Fatal("shared panel and 14 connections did not round trip", err)
 					}
@@ -143,7 +143,7 @@ func testLibrarySync(t *testing.T, ctx context.Context, db *Database, source *Sn
 	if _, err := db.DB.ExecContext(ctx, "INSERT INTO permission (id,role_id,action,scope,kind,attribute,identifier,created,updated) VALUES (9000,9000,'library.panels:read','library.panels:uid:shared','library.panels','uid','shared','2026-01-02 03:04:05','2026-01-02 03:04:05')"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
+	if _, err := db.exportLegacyTargets(ctx, TargetDashboard); err == nil {
 		t.Fatal("export ignored library-specific custom-role permission")
 	}
 	assertRejected(source)
@@ -166,7 +166,7 @@ func testLibrarySync(t *testing.T, ctx context.Context, db *Database, source *Sn
 	if _, err := db.Sync(ctx, legacy, SyncOptions{AllowDelete: true}); err != nil {
 		t.Fatal("legacy sync failed to preserve libraries", err)
 	}
-	got, err := db.ExportTargets(ctx, AllTargets)
+	got, err := db.exportLegacyTargets(ctx, AllTargets)
 	if err != nil || !reflect.DeepEqual(got.LibraryElement, source.LibraryElement) || !reflect.DeepEqual(got.LibraryConnection, source.LibraryConnection) {
 		t.Fatal("legacy sync changed libraries", err)
 	}

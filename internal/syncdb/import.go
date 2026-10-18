@@ -26,22 +26,27 @@ func (mode ImportMode) Validate() error {
 }
 
 type ImportResult struct {
-	Inserted             int
-	Skipped              int
-	Updated              int
-	Deleted              int
-	Unchanged            int
-	Org                  TableResult
-	DataKeys             TableResult
-	DataSource           TableResult
-	Secrets              TableResult
-	Dashboard            TableResult
-	Folder               TableResult
-	DashboardTag         TableResult
-	DashboardVersion     TableResult
-	LibraryElement       TableResult
-	LibraryConnection    TableResult
-	DashboardPermissions TableResult
+	Inserted               int
+	Skipped                int
+	Updated                int
+	Deleted                int
+	Unchanged              int
+	Org                    TableResult
+	DataKeys               TableResult
+	DataSource             TableResult
+	Secrets                TableResult
+	Dashboard              TableResult
+	Folder                 TableResult
+	DashboardTag           TableResult
+	DashboardVersion       TableResult
+	LibraryElement         TableResult
+	LibraryConnection      TableResult
+	DashboardPermissions   TableResult
+	RBACRoles              TableResult
+	RBACUserAssignments    TableResult
+	RBACTeamAssignments    TableResult
+	RBACBuiltinAssignments TableResult
+	DashboardACL           TableResult
 }
 
 type TableResult struct {
@@ -58,6 +63,15 @@ func (d *Database) Import(ctx context.Context, s *Snapshot) error {
 }
 
 func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportMode) (ImportResult, error) {
+	return d.ImportWithOptions(ctx, s, mode, ImportOptions{})
+}
+
+func (d *Database) ImportWithOptions(ctx context.Context, s *Snapshot, mode ImportMode, options ImportOptions) (ImportResult, error) {
+	if s != nil {
+		copy := *s
+		copy.principalMap = options.PrincipalMap
+		s = &copy
+	}
 	if err := mode.Validate(); err != nil {
 		return ImportResult{}, err
 	}
@@ -109,6 +123,7 @@ func (d *Database) ImportWithMode(ctx context.Context, s *Snapshot, mode ImportM
 		return ImportResult{}, err
 	}
 	addPermissionCounts(&result, permissions.count)
+	addRBACCounts(&result, permissions.rbac)
 	if d.Engine == "postgres" {
 		for _, entry := range s.entries() {
 			if !entry.numeric || (mode == ImportInsertOnly && inserted[entry.name] == 0) {

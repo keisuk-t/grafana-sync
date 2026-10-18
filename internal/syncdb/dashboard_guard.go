@@ -77,6 +77,10 @@ func (d *Database) checkDashboardStorage(ctx context.Context, tx *sql.Tx) error 
 }
 
 func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, dashboards Table, destructive bool) error {
+	return d.guardDashboardDependenciesWithRBAC(ctx, tx, dashboards, destructive, false)
+}
+
+func (d *Database) guardDashboardDependenciesWithRBAC(ctx context.Context, tx *sql.Tx, dashboards Table, destructive, rbac bool) error {
 	if len(dashboards.Rows) == 0 {
 		return nil
 	}
@@ -96,6 +100,9 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 		{"alert_rule", "", "dashboard_uid", "org_id", "", true},
 		{"alert_rule", "", "namespace_uid", "org_id", "", true},
 	} {
+		if spec.table == "dashboard_acl" && rbac {
+			continue
+		}
 		if spec.destructiveOnly && !destructive {
 			continue
 		}
@@ -140,7 +147,10 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 			}
 		}
 	}
-	_, err := d.readDashboardPermissions(ctx, tx, dashboards)
+	if rbac {
+		return nil
+	}
+	_, err := d.readRBAC(ctx, tx, permissionResources(dashboards, Table{}))
 	return err
 }
 

@@ -81,9 +81,13 @@ func (d *Database) checkStorage(ctx context.Context, targets Targets) error {
 		}
 	}
 	if targets.Has(TargetDashboard) {
-		for _, name := range []string{"role", "builtin_role", "permission"} {
+		for _, name := range []string{"role", "builtin_role", "permission", "user_role", "team_role", "dashboard_acl", "user", "org_user", "team", "team_member"} {
 			var engine string
-			if err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine); err != nil || !strings.EqualFold(engine, "InnoDB") {
+			err := d.DB.QueryRowContext(ctx, "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", name).Scan(&engine)
+			if err == sql.ErrNoRows && name != "role" && name != "builtin_role" && name != "permission" {
+				continue
+			}
+			if err != nil || !strings.EqualFold(engine, "InnoDB") {
 				return fmt.Errorf("%s must exist and use InnoDB for transactional dashboard permissions", name)
 			}
 		}
@@ -107,7 +111,7 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		return nil, errors.New("cannot begin export transaction")
 	}
 	defer tx.Rollback()
-	s := &Snapshot{Version: 4, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
+	s := &Snapshot{Version: 5, Targets: targets.Names(), Scope: Scope{OrgIDs: []string{}}}
 	org, err := d.readTable(ctx, tx, (&Snapshot{Version: 2}).entries()[0])
 	if err != nil {
 		return nil, err
@@ -133,13 +137,21 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		if err := d.checkDashboardStorage(ctx, tx); err != nil {
 			return nil, err
 		}
-		if err := d.guardDashboardDependencies(ctx, tx, s.Dashboard, false); err != nil {
+		if err := d.guardDashboardDependenciesWithRBAC(ctx, tx, s.Dashboard, false, true); err != nil {
 			return nil, err
 		}
-		s.DashboardPermissions, err = d.readResourcePermissions(ctx, tx, permissionResources(s.Dashboard, s.LibraryElement))
+		s.RBAC, err = d.readRBAC(ctx, tx, permissionResources(s.Dashboard, s.LibraryElement))
 		if err != nil {
 			return nil, err
 		}
+		aclRows, err := d.readLegacyACL(ctx, tx, s.Dashboard, s.ScopeIDs(), s.RBAC, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range aclRows {
+			s.RBAC.LegacyACL = append(s.RBAC.LegacyACL, row.RBACACL)
+		}
+		canonicalizeManagedRBAC(s.RBAC)
 	}
 	if err := s.Validate(); err != nil {
 		return nil, err

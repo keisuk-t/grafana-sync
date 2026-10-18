@@ -112,6 +112,7 @@ func (s *Snapshot) Select(targets Targets) (*Snapshot, error) {
 	selected.Scope = Scope{OrgIDs: append([]string{}, s.ScopeIDs()...)}
 	if !targets.Has(TargetDashboard) {
 		selected.DashboardPermissions = nil
+		selected.RBAC = nil
 	}
 	for _, entry := range selected.allEntries() {
 		if !targets.Has(entry.group) {

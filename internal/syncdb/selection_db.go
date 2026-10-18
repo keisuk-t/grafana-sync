@@ -20,6 +20,15 @@ func (d *Database) lockTargets(ctx context.Context, tx *sql.Tx, s *Snapshot) err
 		for _, name := range []string{"role", "builtin_role", "permission"} {
 			names = append(names, d.quote(name))
 		}
+		for _, name := range []string{"user_role", "team_role", "dashboard_acl", "user", "org_user", "team", "team_member"} {
+			exists, err := d.tableExists(ctx, tx, name)
+			if err != nil {
+				return err
+			}
+			if exists {
+				names = append(names, d.quote(name))
+			}
+		}
 		if s.Version < 4 {
 			names = append(names, d.quote("library_element"), d.quote("library_element_connection"))
 		}
