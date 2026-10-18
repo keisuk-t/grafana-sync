@@ -1,19 +1,33 @@
 package syncdb
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
+	"unicode/utf8"
 )
 
 func (s *Snapshot) rehomeOrphanLibraryPanels() (int, error) {
+	count, _, err := s.rehomeOrphanLibraryPanelsWithOptions(false)
+	return count, err
+}
+
+func (s *Snapshot) rehomeOrphanLibraryPanelsWithOptions(renameCollisions bool) (int, int, error) {
 	if err := requireColumns(s.LibraryElement, "library_element", "folder_id", "folder_uid"); err != nil {
-		return 0, err
+		return 0, 0, err
+	}
+	if renameCollisions {
+		if err := requireColumns(s.LibraryElement, "library_element", "id", "org_id", "name"); err != nil {
+			return 0, 0, err
+		}
 	}
 	dashboards := syncRowsByID(s.Dashboard, "id")
 	count := 0
+	moved := make(map[string]bool)
 	for _, row := range s.LibraryElement.Rows {
 		id, err := strconv.ParseInt(cell(s.LibraryElement, row, "folder_id"), 10, 64)
 		if err != nil || id <= 0 || cell(s.LibraryElement, row, "folder_uid") != "" || dashboards[id] != nil {
@@ -22,9 +36,81 @@ func (s *Snapshot) rehomeOrphanLibraryPanels() (int, error) {
 		idValue, uidValue := "0", "general"
 		row[columnIndex(s.LibraryElement.Columns, "folder_id")] = &idValue
 		row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = &uidValue
+		moved[cell(s.LibraryElement, row, "id")] = true
 		count++
 	}
-	return count, nil
+	if !renameCollisions {
+		return count, 0, nil
+	}
+	renamed, err := s.renameRehomedLibraryPanels(moved)
+	return count, renamed, err
+}
+
+func (s *Snapshot) renameRehomedLibraryPanels(moved map[string]bool) (int, error) {
+	type nameKey struct{ org, folder, name string }
+	names := make(map[nameKey]bool)
+	reserved := make(map[nameKey]bool)
+	var candidates [][]*string
+	for _, row := range s.LibraryElement.Rows {
+		if moved[cell(s.LibraryElement, row, "id")] {
+			candidates = append(candidates, row)
+			reserved[nameKey{cell(s.LibraryElement, row, "org_id"), "general", cell(s.LibraryElement, row, "name")}] = true
+			continue
+		}
+		folder := cell(s.LibraryElement, row, "folder_uid")
+		if folder == "" {
+			folder = "general"
+		}
+		names[nameKey{cell(s.LibraryElement, row, "org_id"), folder, cell(s.LibraryElement, row, "name")}] = true
+	}
+	slices.SortFunc(candidates, func(a, b []*string) int {
+		left, _ := syncID(a, s.LibraryElement.Columns, "id")
+		right, _ := syncID(b, s.LibraryElement.Columns, "id")
+		return cmp.Compare(left, right)
+	})
+	renamed := 0
+	for _, row := range candidates {
+		id := cell(s.LibraryElement, row, "id")
+		name := cell(s.LibraryElement, row, "name")
+		key := nameKey{cell(s.LibraryElement, row, "org_id"), "general", name}
+		if !names[key] {
+			names[key] = true
+			continue
+		}
+		if !utf8.ValidString(name) {
+			return 0, fmt.Errorf("cannot rename library panel with invalid name encoding (panel ID %s)", id)
+		}
+		allocated := false
+		for attempt := 1; attempt <= len(s.LibraryElement.Rows)+1; attempt++ {
+			suffix := " [migrated-" + id
+			if attempt > 1 {
+				suffix += "-" + strconv.Itoa(attempt)
+			}
+			suffix += "]"
+			limit := 150 - utf8.RuneCountInString(suffix)
+			if limit < 1 {
+				return 0, fmt.Errorf("cannot rename library panel within the name limit (panel ID %s)", id)
+			}
+			prefix := []rune(name)
+			if len(prefix) > limit {
+				prefix = prefix[:limit]
+			}
+			candidate := string(prefix) + suffix
+			key.name = candidate
+			if names[key] || reserved[key] {
+				continue
+			}
+			row[columnIndex(s.LibraryElement.Columns, "name")] = &candidate
+			names[key] = true
+			renamed++
+			allocated = true
+			break
+		}
+		if !allocated {
+			return 0, fmt.Errorf("cannot generate unique library panel name (panel ID %s)", id)
+		}
+	}
+	return renamed, nil
 }
 
 func libraryReferences(data string) ([]string, error) {

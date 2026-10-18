@@ -24,6 +24,8 @@ Global/shared role differences and Unified Storage are not supported.
 Export --rehome-orphan-library-panels explicitly moves panels with a missing
 folder ID and NULL/empty folder UID to General in the JSON only. This can change
 folder-inherited access. Without this flag, missing folders are rejected.
+Export --rename-colliding-library-panels additionally renames only rehomed
+panels whose names collide in General; requires --rehome-orphan-library-panels.
 Import defaults to --mode require-empty. Use --mode insert-only to add missing
 primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
@@ -51,9 +53,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
 	principalMapFile := ""
-	var dryRun, allowDelete, rehomeOrphanLibraryPanels bool
+	var dryRun, allowDelete, rehomeOrphanLibraryPanels, renameCollidingLibraryPanels bool
 	if command == "export" {
 		flags.BoolVar(&rehomeOrphanLibraryPanels, "rehome-orphan-library-panels", false, "move panels with a missing folder ID and NULL/empty folder UID to General in export JSON only; folder-inherited access may change (requires dashboard target)")
+		flags.BoolVar(&renameCollidingLibraryPanels, "rename-colliding-library-panels", false, "rename only rehomed library panels with a name collision in General in export JSON only (requires --rehome-orphan-library-panels)")
 	}
 	if command == "import" {
 		flags.StringVar(&principalMapFile, "principal-map", "", "explicit user/team identity mapping JSON (version 1)")
@@ -80,6 +83,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 	if rehomeOrphanLibraryPanels && !targets.Has(syncdb.TargetDashboard) {
 		return errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
+	}
+	if renameCollidingLibraryPanels && !rehomeOrphanLibraryPanels {
+		return errors.New("--rename-colliding-library-panels requires --rehome-orphan-library-panels")
 	}
 	if command == "import" {
 		if mode != syncdb.ImportSync && (dryRun || allowDelete) {
@@ -165,13 +171,18 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
 		return err
 	} else {
-		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels})
+		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels, RenameCollidingLibraryPanels: renameCollidingLibraryPanels})
 		if err != nil {
 			return err
 		}
 		snapshot = result.Snapshot
 		if result.RehomedLibraryPanels > 0 {
 			if _, err := fmt.Fprintf(stderr, "warning: rehomed %d orphan library panels to General in export JSON only; source database unchanged; folder-inherited access may change\n", result.RehomedLibraryPanels); err != nil {
+				return err
+			}
+		}
+		if result.RenamedLibraryPanels > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: renamed %d rehomed library panels in export JSON only to avoid General name collisions; source database and panel model unchanged\n", result.RenamedLibraryPanels); err != nil {
 				return err
 			}
 		}

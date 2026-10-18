@@ -145,6 +145,38 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		if result, err := db.ExportWithOptions(ctx, AllTargets, ExportOptions{RehomeOrphanLibraryPanels: true}); err == nil || !strings.Contains(err.Error(), "duplicate name") || result != nil || state() != collisionBefore {
 			t.Fatal("rehome did not safely reject a General name collision", err)
 		}
+		renameOptions := ExportOptions{RehomeOrphanLibraryPanels: true, RenameCollidingLibraryPanels: true}
+		renamedWant := cloneSnapshot(t, want)
+		renamedWant.LibraryElement.Rows[1][columnIndex(renamedWant.LibraryElement.Columns, "name")] = str("共有パネル [migrated-41]")
+		for targets := Targets(1); targets <= AllTargets; targets++ {
+			if !targets.Has(TargetDashboard) {
+				continue
+			}
+			expected, err := renamedWant.Select(targets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := db.ExportWithOptions(ctx, targets, renameOptions)
+			if err != nil || result.RehomedLibraryPanels != 8 || result.RenamedLibraryPanels != 1 || !reflect.DeepEqual(result.Snapshot, expected) || state() != collisionBefore {
+				t.Fatal("rename changed more than the colliding orphan name and folder columns", targets, err)
+			}
+		}
+		renamePath := filepath.Join(t.TempDir(), "renamed.dump.json")
+		cmd := exec.CommandContext(ctx, binary, "export", "-db", engine, "-file", renamePath, "--targets", AllTargets.String(), "--rehome-orphan-library-panels", "--rename-colliding-library-panels")
+		cmd.Env = append(os.Environ(), "GRAFANA_SYNC_DSN="+os.Getenv(strings.ToUpper(engine)+"_TEST_DSN"))
+		out, err := cmd.CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "renamed 1 rehomed library panels") || !strings.Contains(string(out), "panel model unchanged") || strings.Contains(string(out), "共有パネル") || strings.Contains(string(out), "shared") {
+			t.Fatal("CLI did not safely report the rename count", err)
+		}
+		renamedData, err := os.ReadFile(renamePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		renamed, err := Decode(bytes.NewReader(renamedData))
+		if err != nil || !reflect.DeepEqual(renamed, renamedWant) || state() != collisionBefore {
+			t.Fatal("CLI renamed export lost model, connections or permissions or changed the source", err)
+		}
+		snapshots[engine+"-renamed"] = renamed
 		if _, err := db.DB.ExecContext(ctx, "UPDATE library_element SET name = "+db.bind(1)+" WHERE id = 41", "共有パネル1"); err != nil {
 			t.Fatal(err)
 		}
@@ -228,6 +260,19 @@ func TestOrphanLibraryFolders(t *testing.T) {
 						}
 					} else if _, err := db.ImportWithOptions(ctx, s, mode, ImportOptions{PrincipalMap: mapping}); err != nil {
 						t.Fatal(err)
+					}
+					if mode == ImportSync && strings.HasSuffix(source, "-renamed") {
+						if _, err := db.DB.ExecContext(ctx, "UPDATE library_element SET name = "+db.bind(1)+" WHERE id = 41", "destination-name"); err != nil {
+							t.Fatal(err)
+						}
+						before := dashboardDatabaseState(t, ctx, db) + rbacState(t, ctx, db) + rbacSequenceState(t, ctx, db)
+						result, err := db.Sync(ctx, s, SyncOptions{DryRun: true, PrincipalMap: mapping})
+						if err != nil || result.LibraryElement.Updated != 1 || before != dashboardDatabaseState(t, ctx, db)+rbacState(t, ctx, db)+rbacSequenceState(t, ctx, db) {
+							t.Fatal("renamed snapshot dry-run did not plan a name update without writing", err)
+						}
+						if _, err := db.Sync(ctx, s, SyncOptions{AllowDelete: true, PrincipalMap: mapping}); err != nil {
+							t.Fatal("could not sync the renamed library panel", err)
+						}
 					}
 					got, err := db.ExportTargets(ctx, AllTargets)
 					if err != nil || !reflect.DeepEqual(got, snapshot) {

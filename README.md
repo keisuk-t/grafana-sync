@@ -170,7 +170,24 @@ DB エラーに機密カラム値が含まれる場合があるため、生の�
 
 **General への配置変更は、フォルダから継承する閲覧・編集権限やライブラリパネルの一覧表示を変える可能性があります。明示的な RBAC を保持しても、移行前と同じ実効アクセス権を保証しません。** 適用前に dry-run、DB バックアップ、General のアクセス設定を確認し、適用後に Grafana で表示・操作・アクセス権を確認してください。
 
-救済対象外の不整合（実在する ID を指すのに UID が欠落、ID／UID の食い違い、空でない未解決 UID、`general` と正の ID の併存、不正な ID）や、移動後の General 内の名前衝突は推測で修復せず拒否します。正常なパネルや既存の General 配下のパネルは変更しません。import／sync の入力検証・対象外の共有参照保護も緩和しません。
+救済対象外の不整合（実在する ID を指すのに UID が欠落、ID／UID の食い違い、空でない未解決 UID、`general` と正の ID の併存、不正な ID）は推測で修復せず拒否します。移動後の General 内の名前衝突も、既定では拒否します。正常なパネルや既存の General 配下のパネルは変更しません。import／sync の入力検証・対象外の共有参照保護も緩和しません。
+
+#### General 内の名前衝突も明示的に救済する場合
+
+パネル名の変更を許可する場合に限り、export 専用の `--rename-colliding-library-panels` を追加できます。単独では使用できず、`--rehome-orphan-library-panels` と `dashboard` 対象が必須です。
+
+```sh
+./bin/grafana-sync export -db mysql -file rescued.dump.json \
+  --targets org,datasource,dashboard \
+  --rehome-orphan-library-panels --rename-colliding-library-panels
+```
+
+- 改名できるのは、この export で General へ移した孤立パネルだけです。既存の General 内のパネルや正常なフォルダ内のパネルは改名しません。対象外の名前衝突は引き続きエラーです。
+- 同じ組織の既存 General 内の名前を優先します。孤立パネル同士だけの衝突なら、移行元の数値 ID が最小のパネルは元の名前を保持します。入力行の並び順には依存しません。
+- それ以外の衝突パネルには `元の名前 [migrated-移行元ID]` を使います。その候補も使用済みなら `元の名前 [migrated-移行元ID-2]` のように連番を加えます。他の移動対象の元の名前も予約して、無関係なパネルの改名を避けます。
+- Grafana の上限150文字に収まるよう、必要な場合だけ元の名前の末尾を Unicode 文字単位で短縮して接尾辞を付けます。移行先 DB の照合順序による追加の衝突は import／sync の検査・DB制約に従い、強行しません。
+- JSON 上の `library_element.name` と再配置の2列だけを変更し、改名件数を警告します。名前・UID・model 内容はログに出しません。元 DB、ID／UID、kind／type、model のバイト列、version、ダッシュボード本体／履歴、関連付け、明示的な RBAC は保持します。model 内の `libraryPanel.name` 等には元の名前が残る場合があります。Grafana が取得時に返す表示名は `library_element.name` に従います。
+- 出力は通常の version 5 JSON で、import にこのオプションは不要です。`sync` は改名も反映しますが、`insert-only` は既存行の名前を変更しません。バックアップと dry-run、移行後の表示・参照・実効アクセス権の確認が必要です。
 
 ## 権限の対応付け（version 5）
 

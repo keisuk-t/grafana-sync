@@ -22,12 +22,14 @@ type Database struct {
 }
 
 type ExportOptions struct {
-	RehomeOrphanLibraryPanels bool
+	RehomeOrphanLibraryPanels    bool
+	RenameCollidingLibraryPanels bool
 }
 
 type ExportResult struct {
 	Snapshot             *Snapshot
 	RehomedLibraryPanels int
+	RenamedLibraryPanels int
 }
 
 func Open(ctx context.Context, engine, dsn string) (*Database, error) {
@@ -123,6 +125,9 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 	if options.RehomeOrphanLibraryPanels && !targets.Has(TargetDashboard) {
 		return nil, errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
 	}
+	if options.RenameCollidingLibraryPanels && !options.RehomeOrphanLibraryPanels {
+		return nil, errors.New("--rename-colliding-library-panels requires --rehome-orphan-library-panels")
+	}
 	if err := d.checkStorage(ctx, targets); err != nil {
 		return nil, err
 	}
@@ -175,7 +180,7 @@ func (d *Database) ExportWithOptions(ctx context.Context, targets Targets, optio
 		canonicalizeManagedRBAC(s.RBAC)
 	}
 	if options.RehomeOrphanLibraryPanels {
-		result.RehomedLibraryPanels, err = s.rehomeOrphanLibraryPanels()
+		result.RehomedLibraryPanels, result.RenamedLibraryPanels, err = s.rehomeOrphanLibraryPanelsWithOptions(options.RenameCollidingLibraryPanels)
 		if err != nil {
 			return nil, err
 		}

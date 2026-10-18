@@ -116,6 +116,36 @@ func TestRehomeOrphanLibraryPanelsFlag(t *testing.T) {
 	}
 }
 
+func TestRenameCollidingLibraryPanelsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for _, rehome := range []bool{false, true} {
+		for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+			args := []string{"export", "-db", "mysql", "-file", "missing.json", "--targets", targets.String(), "--rename-colliding-library-panels"}
+			want := "--rename-colliding-library-panels requires --rehome-orphan-library-panels"
+			if rehome {
+				args = append(args, "--rehome-orphan-library-panels")
+				want = "--rehome-orphan-library-panels requires --targets including dashboard"
+				if targets.Has(syncdb.TargetDashboard) {
+					want = "DSN environment variable is unset or empty"
+				}
+			}
+			if err := Run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || err.Error() != want {
+				t.Fatal("rename flag accepted without required options or failed before DSN check", targets, err)
+			}
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--rename-colliding-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatal("import accepted export-only name repair", err)
+	}
+	var help bytes.Buffer
+	if err := Run(context.Background(), []string{"export", "--help"}, &bytes.Buffer{}, &help); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(help.String(), "rename-colliding-library-panels") || !strings.Contains(help.String(), "requires --rehome-orphan-library-panels") {
+		t.Fatal("help omitted rename restrictions")
+	}
+}
+
 func TestImportModeFlag(t *testing.T) {
 	t.Setenv("GRAFANA_SYNC_DSN", "")
 	for _, mode := range []string{"require-empty", "insert-only"} {

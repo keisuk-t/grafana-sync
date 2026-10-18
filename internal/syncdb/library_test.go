@@ -92,6 +92,141 @@ func TestRehomeOrphanLibraryPanelsRejectsNameCollision(t *testing.T) {
 	}
 }
 
+func TestRenameCollidingRehomedLibraryPanels(t *testing.T) {
+	s := librarySnapshot()
+	base := s.LibraryElement.Rows[0]
+	set := func(row []*string, column, value string) {
+		row[columnIndex(s.LibraryElement.Columns, column)] = str(value)
+	}
+	set(base, "folder_id", "404")
+	set(base, "folder_uid", "")
+	set(base, "name", "同じ名前")
+	add := func(id, name, folderID, folderUID string) {
+		row := append([]*string{}, base...)
+		set(row, "id", id)
+		set(row, "uid", "panel-"+id)
+		set(row, "name", name)
+		set(row, "folder_id", folderID)
+		set(row, "folder_uid", folderUID)
+		set(row, "model", `{"uid":"panel-`+id+`","type":"timeseries"}`)
+		s.LibraryElement.Rows = append(s.LibraryElement.Rows, row)
+	}
+	add("41", "同じ名前", "405", "")
+	add("42", "既存名", "0", "general")
+	add("43", "既存名", "406", "")
+	add("44", "同じ名前 [migrated-41]", "407", "")
+	add("45", "同じ名前 [migrated-41-2]", "0", "general")
+	add("46", "同じ名前", "408", "")
+	s.LibraryElement.Rows[0], s.LibraryElement.Rows[1] = s.LibraryElement.Rows[1], s.LibraryElement.Rows[0]
+	models := make(map[string]string)
+	for _, row := range s.LibraryElement.Rows {
+		models[cell(s.LibraryElement, row, "id")] = cell(s.LibraryElement, row, "model")
+	}
+	if count, err := s.rehomeOrphanLibraryPanels(); err != nil || count != 5 {
+		t.Fatal("legacy rehome changed behavior", count, err)
+	}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate name") {
+		t.Fatal("unapproved rename accepted collision", err)
+	}
+	s = librarySnapshot()
+	base = s.LibraryElement.Rows[0]
+	set(base, "folder_id", "404")
+	set(base, "folder_uid", "")
+	set(base, "name", "同じ名前")
+	add("41", "同じ名前", "405", "")
+	add("42", "既存名", "0", "general")
+	add("43", "既存名", "406", "")
+	add("44", "同じ名前 [migrated-41]", "407", "")
+	add("45", "同じ名前 [migrated-41-2]", "0", "general")
+	add("46", "同じ名前", "408", "")
+	s.LibraryElement.Rows[0], s.LibraryElement.Rows[1] = s.LibraryElement.Rows[1], s.LibraryElement.Rows[0]
+	count, renamed, err := s.rehomeOrphanLibraryPanelsWithOptions(true)
+	if err != nil || count != 5 || renamed != 3 {
+		t.Fatal("wrong relocation or rename count", count, renamed, err)
+	}
+	want := map[string]string{
+		"40": "同じ名前", "41": "同じ名前 [migrated-41-3]", "42": "既存名",
+		"43": "既存名 [migrated-43]", "44": "同じ名前 [migrated-41]",
+		"45": "同じ名前 [migrated-41-2]", "46": "同じ名前 [migrated-46]",
+	}
+	for _, row := range s.LibraryElement.Rows {
+		id := cell(s.LibraryElement, row, "id")
+		if name := cell(s.LibraryElement, row, "name"); name != want[id] || cell(s.LibraryElement, row, "model") != models[id] {
+			t.Fatal("changed protected data or chose an unstable name", id)
+		}
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatal("renamed snapshot is invalid", err)
+	}
+	before, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, renamed, err = s.rehomeOrphanLibraryPanelsWithOptions(true); err != nil || count != 0 || renamed != 0 {
+		t.Fatal("rename is not idempotent", count, renamed, err)
+	}
+	after, err := json.Marshal(s)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("repeat rename modified snapshot", err)
+	}
+}
+
+func TestRenameRehomedLibraryPanelNameLimit(t *testing.T) {
+	s := librarySnapshot()
+	row := s.LibraryElement.Rows[0]
+	row[columnIndex(s.LibraryElement.Columns, "folder_id")] = str("404")
+	row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = nil
+	row[columnIndex(s.LibraryElement.Columns, "name")] = str(strings.Repeat("長", 150))
+	other := append([]*string{}, row...)
+	other[columnIndex(s.LibraryElement.Columns, "id")] = str("41")
+	other[columnIndex(s.LibraryElement.Columns, "uid")] = str("other")
+	other[columnIndex(s.LibraryElement.Columns, "model")] = str(`{"uid":"other","type":"timeseries"}`)
+	s.LibraryElement.Rows = append(s.LibraryElement.Rows, other)
+	count, renamed, err := s.rehomeOrphanLibraryPanelsWithOptions(true)
+	if err != nil || count != 2 || renamed != 1 {
+		t.Fatal(count, renamed, err)
+	}
+	name := cell(s.LibraryElement, other, "name")
+	if len([]rune(name)) != 150 || !strings.HasSuffix(name, " [migrated-41]") || !strings.HasPrefix(name, "長") || cell(s.LibraryElement, row, "name") != strings.Repeat("長", 150) {
+		t.Fatal("name was not safely limited")
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenameRehomedLibraryPanelsDoesNotRepairOtherCollisions(t *testing.T) {
+	s := librarySnapshot()
+	other := append([]*string{}, s.LibraryElement.Rows[0]...)
+	other[columnIndex(s.LibraryElement.Columns, "id")] = str("41")
+	other[columnIndex(s.LibraryElement.Columns, "uid")] = str("other")
+	other[columnIndex(s.LibraryElement.Columns, "model")] = str(`{"uid":"other","type":"timeseries"}`)
+	s.LibraryElement.Rows = append(s.LibraryElement.Rows, other)
+	for _, folder := range []string{"child", "general"} {
+		for _, row := range s.LibraryElement.Rows {
+			row[columnIndex(s.LibraryElement.Columns, "folder_uid")] = str(folder)
+		}
+		before, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count, renamed, err := s.rehomeOrphanLibraryPanelsWithOptions(true); err != nil || count != 0 || renamed != 0 {
+			t.Fatal("renamed a panel that was not rehomed", count, renamed, err)
+		}
+		after, err := json.Marshal(s)
+		if err != nil || string(before) != string(after) {
+			t.Fatal("changed non-orphan collision", err)
+		}
+		if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate name") {
+			t.Fatal("accepted non-orphan collision", err)
+		}
+	}
+	db := &Database{}
+	if _, err := db.ExportWithOptions(context.Background(), TargetDashboard, ExportOptions{RenameCollidingLibraryPanels: true}); err == nil || !strings.Contains(err.Error(), "requires --rehome-orphan-library-panels") {
+		t.Fatal("accepted rename option without rehome before connecting", err)
+	}
+}
+
 func librarySnapshot() *Snapshot {
 	s := dashboardSnapshot()
 	s.Version = 4
