@@ -8,6 +8,7 @@ import (
 	"errors"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -81,55 +82,63 @@ func (d *Database) checkBuiltinBinding(ctx context.Context, tx *sql.Tx, id int64
 func (d *Database) readDashboardPermissions(ctx context.Context, tx *sql.Tx, dashboards Table) ([]DashboardPermission, error) {
 	permissions := []DashboardPermission{}
 	checked := make(map[int64]bool)
-	resources := make(map[string]bool)
+	type resource struct{ org, scope string }
+	resources := []resource{}
+	seen := make(map[string]bool)
 	expected := make(map[string]bool)
 	for _, row := range dashboards.Rows {
-		expected[cell(dashboards, row, "org_id")+"/"+permissionScope(dashboards, row)] = true
-	}
-	for _, row := range dashboards.Rows {
-		org, uid := cell(dashboards, row, "org_id"), cell(dashboards, row, "uid")
+		org, uid := strconv.FormatInt(rowOrg(dashboards, row), 10), cell(dashboards, row, "uid")
+		expected[org+"/"+permissionScope(dashboards, row)] = true
 		for _, kind := range []string{"dashboards", "folders"} {
 			scope := kind + ":uid:" + uid
-			if resources[org+"/"+scope] {
-				continue
+			if !seen[org+"/"+scope] {
+				resources = append(resources, resource{org, scope})
+				seen[org+"/"+scope] = true
 			}
-			resources[org+"/"+scope] = true
-			query := "SELECT p.role_id, COALESCE(r.name, ''), p.action, p.kind, p.attribute, p.identifier FROM " + d.quote("permission") + " p LEFT JOIN " + d.quote("role") + " r ON r.id = p.role_id WHERE p.scope = " + d.bind(1) + " AND (r.org_id = " + d.bind(2) + " OR r.org_id = 0 OR r.id IS NULL) ORDER BY r.name, p.action"
-			rows, err := tx.QueryContext(ctx, query, scope, org)
-			if err != nil {
-				return nil, errors.New("cannot inspect dashboard resource permissions")
+		}
+	}
+	for batch := range slices.Chunk(resources, dashboardQueryBatchSize) {
+		args := make([]any, 0, 2*len(batch))
+		conditions := make([]string, 0, len(batch))
+		for _, r := range batch {
+			conditions = append(conditions, "(p.scope = "+d.bind(len(args)+1)+" AND (r.org_id = "+d.bind(len(args)+2)+" OR r.org_id = 0 OR r.id IS NULL))")
+			args = append(args, r.scope, r.org)
+		}
+		query := "SELECT p.role_id, COALESCE(r.org_id, 0), COALESCE(r.name, ''), p.scope, p.action, p.kind, p.attribute, p.identifier FROM " + d.quote("permission") + " p LEFT JOIN " + d.quote("role") + " r ON r.id = p.role_id WHERE " + strings.Join(conditions, " OR ")
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, dashboardDependencyError("permission", err)
+		}
+		bindings := make(map[int64]struct{ org, role string })
+		for rows.Next() {
+			var id int64
+			var org, name, scope, action, storedKind, attribute, identifier string
+			if err := rows.Scan(&id, &org, &name, &scope, &action, &storedKind, &attribute, &identifier); err != nil {
+				rows.Close()
+				return nil, errors.New("cannot read dashboard resource permissions")
 			}
-			bindings := make(map[int64]string)
-			for rows.Next() {
-				var id int64
-				var name, action, storedKind, attribute, identifier string
-				if err := rows.Scan(&id, &name, &action, &storedKind, &attribute, &identifier); err != nil {
-					rows.Close()
-					return nil, errors.New("cannot read dashboard resource permissions")
-				}
-				role := "Viewer"
-				if name == managedRole("Editor") {
-					role = "Editor"
-				}
-				if name != managedRole(role) || !permissionAction.MatchString(action) || !expected[org+"/"+scope] || storedKind != kind || attribute != "uid" || identifier != uid {
-					rows.Close()
-					return nil, errors.New("dashboard has unsupported individual, team, custom-role or malformed RBAC permissions; no changes applied")
-				}
-				permissions = append(permissions, DashboardPermission{org, role, action, scope})
-				bindings[id] = role
+			role := "Viewer"
+			if name == managedRole("Editor") {
+				role = "Editor"
 			}
-			err = rows.Err()
-			rows.Close()
-			if err != nil {
-				return nil, errors.New("cannot finish reading dashboard permissions")
+			if name != managedRole(role) || !permissionAction.MatchString(action) || !expected[org+"/"+scope] || (storedKind != "dashboards" && storedKind != "folders") || scope != storedKind+":uid:"+identifier || attribute != "uid" {
+				rows.Close()
+				return nil, errors.New("dashboard has unsupported individual, team, custom-role or malformed RBAC permissions; no changes applied")
 			}
-			for id, role := range bindings {
-				if !checked[id] {
-					if err := d.checkBuiltinBinding(ctx, tx, id, org, role); err != nil {
-						return nil, err
-					}
-					checked[id] = true
+			permissions = append(permissions, DashboardPermission{org, role, action, scope})
+			bindings[id] = struct{ org, role string }{org, role}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, dashboardDependencyError("permission", err)
+		}
+		for id, binding := range bindings {
+			if !checked[id] {
+				if err := d.checkBuiltinBinding(ctx, tx, id, binding.org, binding.role); err != nil {
+					return nil, err
 				}
+				checked[id] = true
 			}
 		}
 	}

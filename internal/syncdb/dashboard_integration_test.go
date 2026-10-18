@@ -223,6 +223,129 @@ func TestDashboardTransfer(t *testing.T) {
 	for engine, db := range databases {
 		t.Run(engine+"_dashboard_sync", func(t *testing.T) { testDashboardSync(t, ctx, db, snapshots[engine]) })
 		t.Run(engine+"_dashboard_guards", func(t *testing.T) { testDashboardGuards(t, ctx, db, snapshots[engine]) })
+		t.Run(engine+"_dashboard_batches", func(t *testing.T) { testDashboardBatches(t, ctx, db, snapshots[engine]) })
+	}
+}
+
+func testDashboardBatches(t *testing.T, ctx context.Context, db *Database, source *Snapshot) {
+	large := cloneSnapshot(t, source)
+	org := cell(large.Dashboard, large.Dashboard.Rows[2], "org_id")
+	for i := range 3000 {
+		row := append([]*string{}, large.Dashboard.Rows[2]...)
+		for name, value := range map[string]string{
+			"id": strconv.Itoa(1000 + i), "uid": "batch-" + strconv.Itoa(i),
+			"title": "Batch " + strconv.Itoa(i), "data": `{"panels":[]}`,
+		} {
+			row[columnIndex(large.Dashboard.Columns, name)] = str(value)
+		}
+		large.Dashboard.Rows = append(large.Dashboard.Rows, row)
+		large.DashboardPermissions = append(large.DashboardPermissions,
+			DashboardPermission{org, "Viewer", "dashboards:read", "dashboards:uid:batch-" + strconv.Itoa(i)},
+			DashboardPermission{org, "Editor", "dashboards:write", "dashboards:uid:batch-" + strconv.Itoa(i)},
+		)
+	}
+	clearDashboardFixtures(t, ctx, db)
+	if err := db.Import(ctx, large); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	got, err := db.ExportTargets(ctx, AllTargets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("exported %d dashboards and %d permissions in %s", len(got.Dashboard.Rows), len(got.DashboardPermissions), time.Since(started))
+	if !reflect.DeepEqual(got.Dashboard, large.Dashboard) || len(got.DashboardPermissions) != len(large.DashboardPermissions) {
+		t.Fatal("batched export changed dashboards or permission counts")
+	}
+	wanted := make(map[DashboardPermission]bool)
+	for _, p := range large.DashboardPermissions {
+		wanted[p] = true
+	}
+	for _, p := range got.DashboardPermissions {
+		if !wanted[p] {
+			t.Fatal("batched export changed permissions")
+		}
+		delete(wanted, p)
+	}
+	if len(wanted) != 0 {
+		t.Fatal("batched export lost permissions")
+	}
+	// The dependency is in the last batch, not the first one.
+	if _, err := db.DB.ExecContext(ctx, "CREATE TABLE dashboard_provisioning (dashboard_id BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_provisioning VALUES (3999)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported dependencies in dashboard_provisioning") {
+		t.Fatal("last dependency batch was not checked", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "DROP TABLE dashboard_provisioning"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "CREATE TABLE dashboard_provisioning (unexpected BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExportTargets(ctx, TargetDashboard)
+	if err == nil || !strings.Contains(err.Error(), "expected dependency column is missing") || !strings.Contains(err.Error(), "dashboard_provisioning") {
+		t.Fatal("missing column diagnostic is not actionable", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "DROP TABLE dashboard_provisioning"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "CREATE TABLE dashboard_public (dashboard_uid VARCHAR(40), org_id BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_public VALUES ('batch-2999', 77)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+		t.Fatal("batched query matched another organization's UID", err)
+	}
+	checkDependencies := func() error {
+		tx, err := db.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		return db.guardDashboardDependencies(ctx, tx, large.Dashboard, true)
+	}
+	if err := checkDependencies(); err != nil {
+		t.Fatal("batched destructive query matched another organization's UID", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO dashboard_public VALUES ('batch-2999', "+db.bind(1)+")", org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+		t.Fatal("export rejected excluded public sharing settings", err)
+	}
+	err = checkDependencies()
+	if err == nil || !strings.Contains(err.Error(), "unsupported dependencies in dashboard_public") {
+		t.Fatal("last organization/UID batch was not checked", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "DROP TABLE dashboard_public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO "+db.quote("role")+" (name, version, org_id, uid, created, updated) VALUES ('batch-custom-role', 0, 77, 'batch-custom-role', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "INSERT INTO permission (role_id, action, scope, kind, attribute, identifier, created, updated) SELECT id, 'dashboards:read', 'dashboards:uid:batch-2999', 'dashboards', 'uid', 'batch-2999', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP FROM "+db.quote("role")+" WHERE name = 'batch-custom-role'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+		t.Fatal("batched permissions matched another organization's UID", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "UPDATE "+db.quote("role")+" SET org_id = "+db.bind(1)+" WHERE name = 'batch-custom-role'", org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil || !strings.Contains(err.Error(), "unsupported individual, team, custom-role or malformed RBAC") {
+		t.Fatal("last permission batch was not checked", err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "DELETE FROM permission WHERE role_id IN (SELECT id FROM "+db.quote("role")+" WHERE name = 'batch-custom-role')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.ExecContext(ctx, "DELETE FROM "+db.quote("role")+" WHERE name = 'batch-custom-role'"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -430,7 +553,7 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 	}{
 		{"dashboard_acl", "dashboard_id BIGINT", "12", true},
 		{"dashboard_provisioning", "dashboard_id BIGINT", "12", true},
-		{"dashboard_public", "dashboard_uid VARCHAR(40), org_id BIGINT", "'board',9007199254740993", true},
+		{"dashboard_public", "dashboard_uid VARCHAR(40), org_id BIGINT, access_token VARCHAR(40), is_enabled BIGINT", "'board',9007199254740993,'test-only-public-token',1", false},
 		{"library_element_connection", "connection_id BIGINT", "12", true},
 		{"star", "dashboard_id BIGINT", "12", false},
 		{"playlist_item", "value VARCHAR(40), type VARCHAR(40)", "'board','dashboard_by_uid'", false},
@@ -448,6 +571,42 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 		if spec.exportReject {
 			if _, err := db.ExportTargets(ctx, TargetDashboard); err == nil {
 				t.Errorf("export ignored %s dependency", spec.name)
+			}
+		} else {
+			if _, err := db.ExportTargets(ctx, TargetDashboard); err != nil {
+				t.Errorf("export rejected excluded %s settings: %v", spec.name, err)
+			}
+		}
+		if spec.name == "dashboard_public" {
+			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard SET is_public = TRUE WHERE id = 12"); err != nil {
+				t.Fatal(err)
+			}
+			exported, err := db.ExportTargets(ctx, TargetDashboard)
+			if err != nil {
+				t.Fatal("export rejected the public metadata flag", err)
+			}
+			for _, row := range exported.Dashboard.Rows {
+				if cell(exported.Dashboard, row, "is_public") != "0" {
+					t.Fatal("export preserved public sharing metadata")
+				}
+			}
+			data, err := json.Marshal(exported)
+			if err != nil || strings.Contains(string(data), "test-only-public-token") || strings.Contains(string(data), "dashboard_public") {
+				t.Fatal("export included public sharing settings")
+			}
+			var public bool
+			if err := db.DB.QueryRowContext(ctx, "SELECT is_public FROM dashboard WHERE id = 12").Scan(&public); err != nil || !public {
+				t.Fatal("export changed source public metadata", err)
+			}
+			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard SET is_public = FALSE WHERE id = 12"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Sync(ctx, s, SyncOptions{AllowDelete: true}); err != nil {
+				t.Fatal("identity-preserving sync rejected target public sharing", err)
+			}
+			var count int
+			if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM dashboard_public WHERE access_token = 'test-only-public-token' AND is_enabled = 1").Scan(&count); err != nil || count != 1 {
+				t.Fatal("sync changed existing target public sharing", err)
 			}
 		}
 		empty := cloneSnapshot(t, s)

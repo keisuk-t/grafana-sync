@@ -6,7 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func (d *Database) tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
@@ -66,7 +71,7 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 	}{
 		{"dashboard_acl", "dashboard_id", "", "", "", false},
 		{"dashboard_provisioning", "dashboard_id", "", "", "", false},
-		{"dashboard_public", "", "dashboard_uid", "org_id", "", false},
+		{"dashboard_public", "", "dashboard_uid", "org_id", "", true},
 		{"library_element_connection", "connection_id", "", "", "", false},
 		{"library_element", "folder_id", "", "org_id", "", true},
 		{"library_element", "", "folder_uid", "org_id", "", true},
@@ -89,17 +94,27 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 		if !exists {
 			continue
 		}
-		for _, row := range dashboards.Rows {
-			column, value := spec.id, cell(dashboards, row, "id")
+		for batch := range slices.Chunk(dashboards.Rows, dashboardQueryBatchSize) {
+			column, field := spec.id, "id"
 			if spec.uid != "" {
-				column, value = spec.uid, cell(dashboards, row, "uid")
+				column, field = spec.uid, "uid"
 			}
-			query := "SELECT 1 FROM " + d.quote(spec.table) + " WHERE " + d.quote(column) + " = " + d.bind(1)
-			args := []any{value}
+			key := d.quote(column)
 			if spec.org != "" {
-				query += " AND " + d.quote(spec.org) + " = " + d.bind(2)
-				args = append(args, rowOrg(dashboards, row))
+				key = "(" + key + ", " + d.quote(spec.org) + ")"
 			}
+			values := make([]string, 0, len(batch))
+			args := make([]any, 0, 2*len(batch))
+			for _, row := range batch {
+				value := d.bind(len(args) + 1)
+				args = append(args, cell(dashboards, row, field))
+				if spec.org != "" {
+					value = "(" + value + ", " + d.bind(len(args)+1) + ")"
+					args = append(args, rowOrg(dashboards, row))
+				}
+				values = append(values, value)
+			}
+			query := "SELECT 1 FROM " + d.quote(spec.table) + " WHERE " + key + " IN (" + strings.Join(values, ", ") + ")"
 			if spec.filter != "" {
 				query += " AND " + spec.filter
 			}
@@ -109,10 +124,49 @@ func (d *Database) guardDashboardDependencies(ctx context.Context, tx *sql.Tx, d
 				return fmt.Errorf("dashboard has unsupported dependencies in %s; no changes applied", spec.table)
 			}
 			if err != sql.ErrNoRows {
-				return fmt.Errorf("cannot inspect dashboard dependencies in %s", spec.table)
+				return dashboardDependencyError(spec.table, err)
 			}
 		}
 	}
 	_, err := d.readDashboardPermissions(ctx, tx, dashboards)
 	return err
+}
+
+const dashboardQueryBatchSize = 256
+
+var dependencySQLState = regexp.MustCompile(`^[0-9A-Z]{5}$`)
+
+func dashboardDependencyError(table string, err error) error {
+	message := "database query failed"
+	var my *mysql.MySQLError
+	var pg *pgconn.PgError
+	switch {
+	case errors.Is(err, context.Canceled):
+		message = "operation canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		message = "query deadline exceeded; increase --timeout for large exports or slow database connections"
+	case errors.As(err, &my):
+		message = fmt.Sprintf("MySQL error %d", my.Number)
+		switch my.Number {
+		case 1142, 1143:
+			message += "; SELECT permission is required on the dependency table and columns"
+		case 1054:
+			message += "; expected dependency column is missing; check the Grafana database schema"
+		case 1146:
+			message += "; dependency table is missing; check the Grafana database schema"
+		}
+	case errors.As(err, &pg):
+		if dependencySQLState.MatchString(pg.Code) {
+			message = "PostgreSQL SQLSTATE " + pg.Code
+		}
+		switch pg.Code {
+		case "42501":
+			message += "; SELECT permission is required on the dependency table and columns"
+		case "42703":
+			message += "; expected dependency column is missing; check the Grafana database schema"
+		case "42P01":
+			message += "; dependency table is missing; check the Grafana database schema"
+		}
+	}
+	return fmt.Errorf("cannot inspect dashboard dependencies in %s: %s", table, message)
 }

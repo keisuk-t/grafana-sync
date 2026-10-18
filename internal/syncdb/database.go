@@ -122,6 +122,14 @@ func (d *Database) ExportTargets(ctx context.Context, targets Targets) (*Snapsho
 		}
 	}
 	if targets.Has(TargetDashboard) {
+		if public := columnIndex(s.Dashboard.Columns, "is_public"); public >= 0 {
+			for _, row := range s.Dashboard.Rows {
+				if cell(s.Dashboard, row, "is_public") == "1" {
+					value := "0"
+					row[public] = &value
+				}
+			}
+		}
 		if err := d.checkDashboardStorage(ctx, tx); err != nil {
 			return nil, err
 		}

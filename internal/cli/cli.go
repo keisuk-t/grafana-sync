@@ -170,7 +170,7 @@ func tableSelected(name string, targets syncdb.Targets) bool {
 func printSelection(out io.Writer, s *syncdb.Snapshot) error {
 	_, err := fmt.Fprintf(out, "targets=%s scope.org_ids=%s\n", s.Selection(), strings.Join(s.ScopeIDs(), ","))
 	if err == nil && s.Selection().Has(syncdb.TargetDashboard) {
-		_, err = fmt.Fprintln(out, "dashboard tables: dashboard,folder,dashboard_tag,dashboard_version; includes Viewer/Editor permissions; warning: dynamic and plugin-specific external references cannot be fully checked")
+		_, err = fmt.Fprintln(out, "dashboard tables: dashboard,folder,dashboard_tag,dashboard_version; includes Viewer/Editor permissions; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
 	}
 	return err
 }

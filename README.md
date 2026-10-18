@@ -124,7 +124,17 @@ JSON には `password`、`basic_auth_password`、`secure_json_data` などを含
 
 `secrets` の抽出条件は [Grafana のデータソースサービス](https://github.com/grafana/grafana/blob/v12.2.0/pkg/services/datasources/service/datasource.go)の参照方法に従います。テーブル構造は [暗号化テーブルのマイグレーション](https://github.com/grafana/grafana/blob/v12.2.0/pkg/services/sqlstore/migrations/secrets_mig.go)で確認できます。
 
-DB エラーに機密カラム値が含まれる場合があるため、接続・書き込みエラーの詳細は CLI に表示しません。テーブル／行番号と DB 側のログを使って調査してください。
+DB エラーに機密カラム値が含まれる場合があるため、生のドライバエラーメッセージは CLI に表示しません。ダッシュボードの依存・権限検査では、タイムアウト／キャンセル、MySQL エラー番号、PostgreSQL SQLSTATE を安全な診断情報として表示します。テーブル／行番号と DB 側のログを使って調査してください。
+
+### 大量のダッシュボードとタイムアウト
+
+`--timeout` の既定値は DB 処理全体で2分です。依存関係とリソース権限は件数を区切って一括照会し、1件ずつの照会による通信往復を減らしています。それでも DB の負荷・通信遅延・JSON の量によってタイムアウトする場合は、次のように延長できます。
+
+```sh
+./bin/grafana-sync export -db mysql -file all.dump.json --targets org,datasource,dashboard --timeout 10m
+```
+
+`cannot inspect dashboard dependencies in ...: query deadline exceeded` は検査自体のタイムアウトです。一方、sync 時の `dashboard has unsupported dependencies in dashboard_public; no changes applied` は、移行先の公開共有参照を壊す削除・ID／UID／組織等の変更を検出したことによる意図的な拒否です。こちらはタイムアウトを延長しても解消しません。
 
 ## ダッシュボードの対応範囲
 
@@ -134,7 +144,9 @@ DB エラーに機密カラム値が含まれる場合があるため、接続�
 - `require-empty` は選択した4テーブルが空であることを要求します。対象UIDの既存権限も競合として拒否します。`insert-only` は既存 dashboard ID を優先し、その配下のタグ・履歴・権限だけを追記しません。
 - `sync` は scope 内のフォルダ・ダッシュボード・タグ・履歴・標準権限を同期します。再作成、UID／名前の交換、フォルダ移動に対応し、対象外組織は保持します。
 - Viewer／Editor の `managed:builtins:*:permissions` に属するリソース権限を、組織・標準ロール名・action・scope で保存します。移行先の role ID は名前と `builtin_role` の結び付きを検証して解決し、必要な管理ロールがなければトランザクション内で作成します。permission／role の元DB固有IDはコピーしません。
-- **ユーザー／チームの個別権限・カスタムロール・個別ACL・provisioning・公開共有・ライブラリパネル依存は拒否します。Grafana が作成者に自動付与した権限も個別権限として停止します。** 標準ロールの承認だけで個別権限を捨てることはありません。これらを持つ通常のダッシュボードでも本ツールでは移行できない場合があります。実データの権限を削除して回避せず、必要な権限と別途の移行方法を検討してください。
+- **公開共有設定は移行しませんが、共有設定のあるダッシュボード本体は export できます。** `dashboard_public` の公開URL・アクセストークン・有効／無効等は JSON に含めず、`dashboard.is_public` は出力内で `0` にします。移行元 DB の設定は変更しません。移行先に共有設定がなければ公開共有は作成されません。
+- 移行先の既存の公開共有設定は削除・更新しません。同じ組織・UIDの本体を更新すると、移行先の既存共有URLにも更新内容が反映され得るため、新規共有を作らないことは移行先を非公開にする保証ではありません。sync で既存共有の参照を壊す削除・ID／UID／組織等の変更は事前エラーにします。
+- **ユーザー／チームの個別権限・カスタムロール・個別ACL・provisioning・ライブラリパネル依存は拒否します。Grafana が作成者に自動付与した権限も個別権限として停止します。** 標準ロールの承認だけで個別権限を捨てることはありません。これらを持つ通常のダッシュボードでも本ツールでは移行できない場合があります。実データの権限を削除して回避せず、必要な権限と別途の移行方法を検討してください。
 - stars・playlist・annotations・alerts・library element 等は移行しません。移行先で削除や ID／UID／組織変更がこれらの参照を壊す場合は事前エラーにします。
 - dashboard本体・履歴JSONの静的な datasource UID／名前参照は、移行後のデータソース状態に対して確認します。`datasource` を選ばない場合は既存 DB を参照します。動的変数・プラグイン固有の外部参照は完全検査できず警告します。移行後に Grafana で表示とクエリを確認してください。
 - `created_by`／`updated_by`・保存履歴内の作成者IDは原値のままで、ユーザー自体は移行せず、IDも再マッピングしません。

@@ -138,3 +138,14 @@ func TestTargetsFlag(t *testing.T) {
 		t.Fatalf("default inferred absent targets: %v", err)
 	}
 }
+
+func TestSelectionExplainsPublicSharingExclusion(t *testing.T) {
+	var out bytes.Buffer
+	s := &syncdb.Snapshot{Version: 3, Targets: []string{"dashboard"}}
+	if err := printSelection(&out, s); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "public sharing settings excluded (existing target sharing unchanged)") {
+		t.Fatal("selection output does not explain public sharing exclusion")
+	}
+}
