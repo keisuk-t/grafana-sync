@@ -1,0 +1,5 @@
+/bin/
+/.env
+/*.dump.json
+/*.test
+/coverage.out
