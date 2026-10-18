@@ -39,13 +39,17 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		})
 		seedFixtures(t, ctx, db)
 		s := librarySnapshot()
-		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
+		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"","name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
 		for i := 1; i < 8; i++ {
 			row := append([]*string{}, s.LibraryElement.Rows[0]...)
 			row[0], row[4], row[5] = str(strconv.Itoa(40+i)), str("shared-"+strconv.Itoa(i)), str("共有パネル"+strconv.Itoa(i))
 			row[8] = str(`{"uid":"shared-` + strconv.Itoa(i) + `","type":"timeseries","libraryPanel":{"uid":"shared-` + strconv.Itoa(i) + `"}}`)
 			if i == 1 {
 				row[8] = str(`{"uid":"shared-1","type":"timeseries","libraryPanel":{}}`)
+			} else if i == 2 {
+				row[8] = str(`{"uid":"shared-2","type":"timeseries","libraryPanel":{"name":"stale metadata","version":1}}`)
+			} else if i <= 6 {
+				row[8] = str(`{"uid":"shared-` + strconv.Itoa(i) + `","type":"timeseries","libraryPanel":{"uid":"","name":"stale metadata","version":1}}`)
 			}
 			s.LibraryElement.Rows = append(s.LibraryElement.Rows, row)
 		}
@@ -249,7 +253,7 @@ func TestLibraryTransfer(t *testing.T) {
 		createDashboardFixtures(t, ctx, db)
 		seedFixtures(t, ctx, db)
 		s := librarySnapshot()
-		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
+		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"","name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
 		s, err = s.Select(TargetDashboard)
 		if err != nil {
 			t.Fatal(err)
@@ -340,9 +344,10 @@ func testLibrarySync(t *testing.T, ctx context.Context, db *Database, source *Sn
 	for _, tc := range []struct{ model, diagnostic string }{
 		{`{"libraryPanel":{"uid":"foreign-uid-canary"}}`, "references another library panel at its root"},
 		{`{"libraryPanel":{"uid":null,"name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
-		{`{"libraryPanel":{"uid":"","name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
+		{`{"libraryPanel":{"uid":false,"name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
 		{`{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
 		{`{"libraryPanel":{"name":"private-name-canary"},"options":{"libraryPanel":{"uid":"foreign-uid-canary"}}}`, "below the model root"},
+		{`{"libraryPanel":{"uid":"","name":"private-name-canary"},"options":{"libraryPanel":{"uid":"foreign-uid-canary"}}}`, "below the model root"},
 	} {
 		s := cloneSnapshot(t, source)
 		s.LibraryElement.Rows[0][columnIndex(s.LibraryElement.Columns, "model")] = str(tc.model)
