@@ -51,6 +51,32 @@ func libraryReferences(data string) ([]string, error) {
 	return refs, nil
 }
 
+func validateLibraryModelReferences(model map[string]any, uid string) error {
+	// Grafana can persist a top-level descriptor of the library panel itself.
+	if value := model["libraryPanel"]; value != nil {
+		panel, ok := value.(map[string]any)
+		stored, _ := panel["uid"].(string)
+		if !ok || stored == "" {
+			return errors.New("invalid top-level libraryPanel metadata")
+		}
+		if stored != uid {
+			return errors.New("library panel model references another library panel at its root; nested library panel references are unsupported")
+		}
+	}
+	nested := false
+	for _, value := range model {
+		walkDocument(value, func(key string, value any) {
+			if key == "libraryPanel" && value != nil {
+				nested = true
+			}
+		})
+	}
+	if nested {
+		return errors.New("nested library panel references are unsupported below the model root")
+	}
+	return nil
+}
+
 func (s *Snapshot) validateLibraryState(scope map[int64]bool) error {
 	if s.Version < 4 && (len(s.LibraryElement.Columns) != 0 || len(s.LibraryConnection.Columns) != 0) {
 		return errors.New("library tables require snapshot version 4")
@@ -117,9 +143,8 @@ func (s *Snapshot) validateLibraryState(scope map[int64]bool) error {
 		if stored, exists := model["type"]; exists && stored != cell(s.LibraryElement, row, "type") {
 			return errors.New("library panel model type differs from its metadata")
 		}
-		refs, err := libraryReferences(cell(s.LibraryElement, row, "model"))
-		if err != nil || len(refs) != 0 {
-			return errors.New("nested library panel references are unsupported")
+		if err := validateLibraryModelReferences(model, uid); err != nil {
+			return fmt.Errorf("%w (panel ID %s)", err, cell(s.LibraryElement, row, "id"))
 		}
 	}
 	connections := make(map[string]bool)

@@ -150,7 +150,7 @@ func TestLibraryValidation(t *testing.T) {
 		{"invalid model", func(s *Snapshot) { s.LibraryElement.Rows[0][8] = str(`{`) }},
 		{"wrong model uid", func(s *Snapshot) { s.LibraryElement.Rows[0][8] = str(`{"uid":"other"}`) }},
 		{"wrong model type", func(s *Snapshot) { s.LibraryElement.Rows[0][8] = str(`{"type":"other"}`) }},
-		{"nested model", func(s *Snapshot) { s.LibraryElement.Rows[0][8] = str(`{"libraryPanel":{"uid":"shared"}}`) }},
+		{"nested model", func(s *Snapshot) { s.LibraryElement.Rows[0][8] = str(`{"options":{"libraryPanel":{"uid":"shared"}}}`) }},
 		{"invalid version", func(s *Snapshot) { s.LibraryElement.Rows[0][9] = str("0") }},
 		{"bad reference", func(s *Snapshot) { s.Dashboard.Rows[2][4] = str(`{"panels":[{"libraryPanel":{}}]}`) }},
 		{"missing history reference", func(s *Snapshot) {
@@ -167,5 +167,62 @@ func TestLibraryValidation(t *testing.T) {
 				t.Fatal("accepted invalid library state")
 			}
 		})
+	}
+}
+
+func TestLibraryModelSelfMetadata(t *testing.T) {
+	for _, version := range []struct {
+		name string
+		make func() *Snapshot
+	}{{"v4", librarySnapshot}, {"v5", rbacSnapshot}} {
+		for _, tc := range []struct {
+			name, model, wantError string
+		}{
+			{"absent", `{}`, ""},
+			{"null", `{"libraryPanel":null}`, ""},
+			{"self", `{"libraryPanel":{"uid":"shared"}}`, ""},
+			{"self metadata", ` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"shared","name":"stale-name-canary","version":1},"options":{"text":"content-canary"}} `, ""},
+			{"nested null", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":null}}`, ""},
+			{"foreign", `{"libraryPanel":{"uid":"foreign-uid-canary","name":"private-name-canary"}}`, "references another library panel at its root"},
+			{"empty UID", `{"libraryPanel":{"uid":""}}`, "invalid top-level libraryPanel metadata"},
+			{"missing UID", `{"libraryPanel":{"name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
+			{"null UID", `{"libraryPanel":{"uid":null}}`, "invalid top-level libraryPanel metadata"},
+			{"numeric UID", `{"libraryPanel":{"uid":40}}`, "invalid top-level libraryPanel metadata"},
+			{"object UID", `{"libraryPanel":{"uid":{"uid":"shared"}}}`, "invalid top-level libraryPanel metadata"},
+			{"nonobject", `{"libraryPanel":"private-value-canary"}`, "invalid top-level libraryPanel metadata"},
+			{"array", `{"libraryPanel":[{"uid":"shared"}]}`, "invalid top-level libraryPanel metadata"},
+			{"nested self", `{"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
+			{"nested foreign", `{"panels":[{"libraryPanel":{"uid":"foreign-uid-canary"}}]}`, "below the model root"},
+			{"self and nested", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
+			{"nested within metadata", `{"libraryPanel":{"uid":"shared","extra":{"libraryPanel":{"uid":"shared"}}}}`, "below the model root"},
+			{"nested malformed", `{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{}}}`, "below the model root"},
+		} {
+			t.Run(version.name+"/"+tc.name, func(t *testing.T) {
+				s := version.make()
+				s.LibraryElement.Rows[0][columnIndex(s.LibraryElement.Columns, "model")] = str(tc.model)
+				before, err := json.Marshal(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = s.Validate()
+				if tc.wantError != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantError) || !strings.Contains(err.Error(), "(panel ID 40)") || strings.Contains(err.Error(), "canary") || strings.Contains(err.Error(), "shared") {
+						t.Fatal("incorrect or unsafe model diagnostic", err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal("rejected valid self metadata", err)
+					}
+					got, err := Decode(strings.NewReader(string(before)))
+					if err != nil || !reflect.DeepEqual(got, s) {
+						t.Fatal("self metadata did not round trip unchanged", err)
+					}
+				}
+				after, err := json.Marshal(s)
+				if err != nil || string(before) != string(after) {
+					t.Fatal("model validation modified the snapshot", err)
+				}
+			})
+		}
 	}
 }

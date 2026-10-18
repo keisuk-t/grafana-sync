@@ -39,10 +39,11 @@ func TestOrphanLibraryFolders(t *testing.T) {
 		})
 		seedFixtures(t, ctx, db)
 		s := librarySnapshot()
+		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"shared","name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
 		for i := 1; i < 8; i++ {
 			row := append([]*string{}, s.LibraryElement.Rows[0]...)
 			row[0], row[4], row[5] = str(strconv.Itoa(40+i)), str("shared-"+strconv.Itoa(i)), str("共有パネル"+strconv.Itoa(i))
-			row[8] = str(`{"uid":"shared-` + strconv.Itoa(i) + `","type":"timeseries"}`)
+			row[8] = str(`{"uid":"shared-` + strconv.Itoa(i) + `","type":"timeseries","libraryPanel":{"uid":"shared-` + strconv.Itoa(i) + `"}}`)
 			s.LibraryElement.Rows = append(s.LibraryElement.Rows, row)
 		}
 		s, err = s.Select(TargetDashboard)
@@ -244,7 +245,9 @@ func TestLibraryTransfer(t *testing.T) {
 		t.Cleanup(func() { db.DB.Close() })
 		createDashboardFixtures(t, ctx, db)
 		seedFixtures(t, ctx, db)
-		s, err := librarySnapshot().Select(TargetDashboard)
+		s := librarySnapshot()
+		s.LibraryElement.Rows[0][8] = str(` {"uid":"shared","type":"timeseries","libraryPanel":{"uid":"shared","name":"共有パネル","version":1},"datasource":{"uid":"metrics-uid"}} `)
+		s, err = s.Select(TargetDashboard)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -331,6 +334,26 @@ func testLibrarySync(t *testing.T, ctx context.Context, db *Database, source *Sn
 		}
 	}
 	reset()
+	for _, tc := range []struct{ model, diagnostic string }{
+		{`{"libraryPanel":{"uid":"foreign-uid-canary"}}`, "references another library panel at its root"},
+		{`{"libraryPanel":{"name":"private-name-canary"}}`, "invalid top-level libraryPanel metadata"},
+		{`{"libraryPanel":{"uid":"shared"},"options":{"libraryPanel":{"uid":"shared"}}}`, "below the model root"},
+	} {
+		s := cloneSnapshot(t, source)
+		s.LibraryElement.Rows[0][columnIndex(s.LibraryElement.Columns, "model")] = str(tc.model)
+		assertRejected(s)
+		if _, err := db.DB.ExecContext(ctx, "UPDATE library_element SET model = "+db.bind(1)+" WHERE id = 40", tc.model); err != nil {
+			t.Fatal(err)
+		}
+		before := dashboardDatabaseState(t, ctx, db)
+		if _, err := db.ExportTargets(ctx, AllTargets); err == nil || !strings.Contains(err.Error(), tc.diagnostic) || !strings.Contains(err.Error(), "(panel ID 40)") || strings.Contains(err.Error(), "canary") || strings.Contains(err.Error(), "shared") {
+			t.Fatal("export accepted unsupported model references or exposed their values", err)
+		}
+		if dashboardDatabaseState(t, ctx, db) != before {
+			t.Fatal("rejected library export modified the source")
+		}
+		reset()
+	}
 	s := cloneSnapshot(t, source)
 	s.LibraryElement.Rows[0][columnIndex(s.LibraryElement.Columns, "model")] = str(`{"uid":"shared","type":"timeseries","datasource":{"uid":"missing"}}`)
 	assertRejected(s)
