@@ -1,4 +1,4 @@
-.PHONY: build test lint integration
+.PHONY: build test lint integration grafana-integration
 
 build:
 	go build -o bin/grafana-sync ./cmd/grafana-sync
@@ -12,3 +12,7 @@ lint:
 
 integration:
 	bash scripts/test-integration.sh
+
+grafana-integration: build
+	CGO_ENABLED=0 GOOS=linux go build -o bin/grafana-header-probe ./scripts/grafana-probe
+	python3 scripts/test-grafana.py
