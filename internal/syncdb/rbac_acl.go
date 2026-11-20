@@ -11,7 +11,8 @@ import (
 
 type legacyACLRow struct {
 	RBACACL
-	ID string
+	ID          string
+	DashboardID string
 }
 type legacyACLInsert struct {
 	org, dashboard, kind, principal string
@@ -228,6 +229,7 @@ func (d *Database) readLegacyACLWithExclusions(ctx context.Context, tx *sql.Tx, 
 			}
 			a.UID = cell(dashboards, parent, "uid")
 			a.Role = ref
+			a.DashboardID = dashboard
 			result = append(result, a)
 		}
 		err = rows.Err()
@@ -312,7 +314,7 @@ func (d *Database) planLegacyACL(ctx context.Context, tx *sql.Tx, s *Snapshot, m
 		mapped.Role = p.ids[a.Role]
 		logical := aclKey(mapped)
 		wanted[logical] = true
-		if old, ok := present[logical]; ok && old.Permission == a.Permission {
+		if old, ok := present[logical]; ok && old.Permission == a.Permission && old.DashboardID == parents[key] {
 			p.aclCount.Unchanged++
 			continue
 		}
