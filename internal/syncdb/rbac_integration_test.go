@@ -363,6 +363,45 @@ func TestRBACTransfer(t *testing.T) {
 						if rbacState(t, ctx, db) != before {
 							t.Fatal("idempotent import changed roles, principals or grants")
 						}
+						if mode == ImportSync && targets.Has(TargetDashboard) {
+							recreated := cloneSnapshot(t, s)
+							oldID, newID := "", "4242"
+							for _, row := range recreated.Dashboard.Rows {
+								if cell(recreated.Dashboard, row, "uid") == "board" {
+									oldID = cell(recreated.Dashboard, row, "id")
+									row[columnIndex(recreated.Dashboard.Columns, "id")] = str(newID)
+								}
+							}
+							for _, ref := range []struct {
+								table  *Table
+								column string
+							}{{&recreated.DashboardVersion, "dashboard_id"}, {&recreated.DashboardTag, "dashboard_id"}, {&recreated.LibraryConnection, "connection_id"}} {
+								for _, row := range ref.table.Rows {
+									if index := columnIndex(ref.table.Columns, ref.column); index >= 0 && cell(*ref.table, row, ref.column) == oldID {
+										row[index] = str(newID)
+									}
+								}
+							}
+							if oldID == "" {
+								t.Fatal("fixture dashboard is missing")
+							}
+							if _, err := db.Sync(ctx, recreated, SyncOptions{AllowDelete: true, PrincipalMap: mapping}); err != nil {
+								t.Fatal("sync rejected a dashboard recreated under a new ID", err)
+							}
+							var stale, moved int
+							if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM dashboard_acl WHERE dashboard_id="+db.bind(1), oldID).Scan(&stale); err != nil {
+								t.Fatal(err)
+							}
+							if err := db.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM dashboard_acl WHERE dashboard_id="+db.bind(1), newID).Scan(&moved); err != nil {
+								t.Fatal(err)
+							}
+							if stale != 0 || moved != 1 {
+								t.Fatal("legacy ACL was not moved to the recreated dashboard", stale, moved)
+							}
+							if _, err := db.ExportTargets(ctx, AllTargets); err != nil {
+								t.Fatal("recreated dashboard left an orphaned legacy ACL", err)
+							}
+						}
 					})
 				}
 			}
