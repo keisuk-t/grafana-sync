@@ -733,6 +733,20 @@ func testDashboardGuards(t *testing.T, ctx context.Context, db *Database, source
 				t.Errorf("export rejected excluded %s settings: %v", spec.name, err)
 			}
 		}
+		if spec.name == "dashboard_provisioning" {
+			changed := cloneSnapshot(t, s)
+			for _, row := range changed.Dashboard.Rows {
+				if cell(changed.Dashboard, row, "id") == "12" {
+					row[columnIndex(changed.Dashboard.Columns, "title")] = str("provisioned-content-change")
+				}
+			}
+			if _, err := db.Sync(ctx, changed, SyncOptions{AllowDelete: true}); err == nil || !strings.Contains(err.Error(), "unsupported dependencies in dashboard_provisioning") {
+				t.Error("sync overwrote a provisioned dashboard", err)
+			}
+			if before != dashboardDatabaseState(t, ctx, db) {
+				t.Error("rejected provisioned update changed data")
+			}
+		}
 		if spec.name == "dashboard_public" {
 			if _, err := db.DB.ExecContext(ctx, "UPDATE dashboard SET is_public = TRUE WHERE id = 12"); err != nil {
 				t.Fatal(err)

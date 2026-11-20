@@ -63,6 +63,15 @@ func (d *Database) prepareDashboardSync(ctx context.Context, tx *sql.Tx, s *Snap
 		if err := d.guardDashboardDependenciesWithRBAC(ctx, tx, identity, true, s.Version >= 5); err != nil {
 			return err
 		}
+		content := table
+		content.Rows = [][]*string{}
+		for _, row := range plan.update {
+			id, _ := syncID(row, plan.entry.table.Columns, "id")
+			content.Rows = append(content.Rows, plan.previous[id])
+		}
+		if err := d.guardDashboardDependenciesWithRBAC(ctx, tx, content, false, true); err != nil {
+			return err
+		}
 	}
 	if s.Version < 4 {
 		if err := d.preserveLegacyLibraries(ctx, tx, s, final); err != nil {
