@@ -26,3 +26,18 @@ jobs:
           go-version-file: go.mod
       - run: go mod download
       - run: make integration
+  grafana-integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        grafana-version: ["12.2.0", "13.0.11", "13.2.4"]
+    env:
+      GRAFANA_TEST_VERSION: ${{ matrix.grafana-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go mod download
+      - run: make grafana-integration

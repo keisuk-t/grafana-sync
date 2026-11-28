@@ -13,6 +13,10 @@ Grafana の `org`・`data_source` と、データソースの暗号化情報に�
 
 ## セットアップ
 
+Grafana 12／13 の標準 SQL ストレージを対象とします。データソースの Unified Storage 移行・dual-write を使用する構成は対象外です。バージョン番号による処理分岐は不要なため、Grafana バージョン指定フラグはありません。実際のカラム構成・型を検査して転送します。[Grafana 13 の依存性調査](docs/grafana-13-compatibility.md)も参照してください。
+
+Grafana 13 では MySQL の `data_source.json_data` が `MEDIUMTEXT` に拡張されています。本ツールは対応していますが、Grafana 12.2.0 などの旧 `TEXT` カラムへ64 KiBを超える値を戻すことはできません。異なる Grafana バージョン間での無条件な互換性は保証しません。
+
 Go 1.26 以上が必要です。`sync` の MySQL 対応は 8.0 以上です（論理キーの事前検査に `JSON_TABLE` を使用）。実 DB テストには Docker Engine と Docker Compose v2 も必要です。
 
 ```sh
@@ -146,6 +150,7 @@ make lint         # gofmt チェックと go vet
 make test         # 単体テストと race detector
 make build
 make integration  # 一時的な MySQL 8.4 / PostgreSQL 17 を Docker で起動して検証
+make grafana-integration # Grafana 13.2.4 本体のスキーマ・暗号文で CLI を検証（Python 3 も必要）
 ```
 
 `make integration` は専用の Compose プロジェクトを作成し、終了時にそのコンテナとボリュームを削除します。ローカルホストのランダムポートのみ公開します。MySQL → MySQL、PostgreSQL → PostgreSQL、両エンジン間の往復、ID 採番、NULL・Unicode・暗号文・バイナリ鍵・無効化済み鍵の保持、秘密情報の抽出範囲、追加テーブルの既存行拒否、全対象テーブルのロールバック、対象外テーブルの不変性を検証します。
@@ -161,6 +166,10 @@ go test -race -tags=integration -p 1 ./internal/cli ./internal/syncdb -count=1 -
 ```
 
 GitHub Actions でも lint・単体テスト・ビルド・実 DB テストを実行します。
+
+`make grafana-integration` は専用の MySQL／PostgreSQL と Grafana 本体を起動し、本体のマイグレーション・API でスキーマと暗号文を生成します。CLI 経由で両 DB 間の4経路・3つのインポートモード、再実行、sync の dry-run、現行鍵と無効化済み鍵の保持・復号、13系で64 KiBを超える JSON の保持を検証します。復号は UID ベースのデータソースプロキシからテスト用 HTTP サーバーへ秘密ヘッダーが送信されることで確認します。ヘッダー受信用の小さな Go 製 HTTP サーバーを専用コンテナで起動し、Compose の内部ネットワークで接続します。受信サーバーのポートはホストへ公開しません。ローカルのテストサービスは `NO_PROXY` に指定します。外部 DB の接続文字列は受け付けず、終了時に専用コンテナ・ボリュームを削除します。
+
+`GRAFANA_TEST_VERSION=12.2.0 make grafana-integration` のように本体の検証バージョンを変更できます（CLI のフラグではありません）。CI は12.2.0・13.0.11・13.2.4を対象にします。Grafana 13.0.0 は Git Sync のアップグレード障害で配布が取り下げられているため使用しません。Grafana 自身のアップグレードや対象外テーブルの移行は本ツールでは行いません。
 
 追加の手動検証では Grafana 12.2.0 本体の SQL スキーマと共通の `secret_key` を使用し、MySQL → PostgreSQL → MySQL の移行後に、現行鍵と無効化済み鍵で暗号化されたデータソースの HTTP ヘッダーが復号・送信されることを API プロキシ経由で確認しました。KMS／Enterprise 暗号方式は未検証です。
 

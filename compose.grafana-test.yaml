@@ -1,0 +1,50 @@
+services:
+  header-probe:
+    image: ${GRAFANA_TEST_PROBE_IMAGE:?Run make grafana-integration}
+  mysql:
+    extends:
+      file: compose.test.yaml
+      service: mysql
+  postgres:
+    extends:
+      file: compose.test.yaml
+      service: postgres
+  grafana-mysql:
+    image: grafana/grafana:${GRAFANA_TEST_VERSION:-13.2.4}
+    environment:
+      GF_DATABASE_TYPE: mysql
+      GF_DATABASE_HOST: mysql:3306
+      GF_DATABASE_NAME: grafana_sync_test
+      GF_DATABASE_USER: grafana
+      GF_DATABASE_PASSWORD: local-test-password
+      GF_SECURITY_SECRET_KEY: grafana-sync-disposable-test-key
+      GF_SECURITY_ADMIN_PASSWORD: local-test-admin
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_LOG_LEVEL: error
+      NO_PROXY: header-probe,mysql,postgres,localhost,127.0.0.1
+      no_proxy: header-probe,mysql,postgres,localhost,127.0.0.1
+    ports:
+      - "127.0.0.1::3000"
+  grafana-postgres:
+    image: grafana/grafana:${GRAFANA_TEST_VERSION:-13.2.4}
+    environment:
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: postgres:5432
+      GF_DATABASE_NAME: grafana_sync_test
+      GF_DATABASE_USER: grafana
+      GF_DATABASE_PASSWORD: local-test-password
+      GF_DATABASE_SSL_MODE: disable
+      GF_SECURITY_SECRET_KEY: grafana-sync-disposable-test-key
+      GF_SECURITY_ADMIN_PASSWORD: local-test-admin
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_LOG_LEVEL: error
+      NO_PROXY: header-probe,mysql,postgres,localhost,127.0.0.1
+      no_proxy: header-probe,mysql,postgres,localhost,127.0.0.1
+    ports:
+      - "127.0.0.1::3000"
