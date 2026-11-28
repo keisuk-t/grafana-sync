@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/keisuk-t/grafana-sync/internal/syncdb"
@@ -15,13 +16,26 @@ import (
 
 const usage = `Usage: grafana-sync <export|import> -db <mysql|postgres> -file <snapshot.json> [options]
 
-Transfers org, data_source, all data_keys and matching datasource secrets.
+Transfers --targets org,datasource,dashboard (default: org,datasource).
+Datasource includes data_keys and matching datasource secrets. Dashboard includes
+legacy SQL folders, tags, versions and resource RBAC. Version 5 individual/team
+grants require --principal-map and pre-existing matching users and teams.
+Global/shared role differences and Unified Storage are not supported.
+Export --exclude-library-panel-dashboards omits dashboards with library-panel
+references in current JSON, history or connections, and all library panels and
+connections. Filtered snapshots cannot be used for dashboard sync. Cannot be
+combined with library rehome or rename options. Source data is unchanged.
+Export --rehome-orphan-library-panels explicitly moves panels with a missing
+folder ID and NULL/empty folder UID to General in the JSON only. This can change
+folder-inherited access. Without this flag, missing folders are rejected.
+Export --rename-colliding-library-panels additionally renames only rehomed
+panels whose names collide in General; requires --rehome-orphan-library-panels.
 Import defaults to --mode require-empty. Use --mode insert-only to add missing
 primary keys without changing existing rows. Credentials are read from
 GRAFANA_SYNC_DSN (or -dsn-env). Original secret_key or KMS keys remain required.
 Use --mode sync --dry-run to inspect changes in the JSON's organizations, then
---mode sync --allow-delete to apply. Missing data sources and datasource secrets
-in those organizations are deleted. Other organizations and shared keys remain.
+--mode sync --allow-delete to apply. Selected resources missing from the JSON
+are deleted only in scope.org_ids. Unselected groups and shared keys remain.
 Stop Grafana and back up the target before importing. Dumps contain secrets.
 `
 
@@ -40,9 +54,17 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	file := flags.String("file", "", "snapshot path (export refuses to overwrite)")
 	dsnEnv := flags.String("dsn-env", "GRAFANA_SYNC_DSN", "environment variable containing the database DSN")
 	timeout := flags.Duration("timeout", 2*time.Minute, "database operation timeout")
+	targetNames := flags.String("targets", "org,datasource", "comma-separated resource targets: org,datasource,dashboard")
 	modeName := string(syncdb.ImportRequireEmpty)
-	var dryRun, allowDelete bool
+	principalMapFile := ""
+	var dryRun, allowDelete, rehomeOrphanLibraryPanels, renameCollidingLibraryPanels, excludeLibraryPanelDashboards bool
+	if command == "export" {
+		flags.BoolVar(&excludeLibraryPanelDashboards, "exclude-library-panel-dashboards", false, "exclude dashboards using library panels in current JSON, history or connections, and all library panels; filtered dashboard snapshots cannot be synced")
+		flags.BoolVar(&rehomeOrphanLibraryPanels, "rehome-orphan-library-panels", false, "move panels with a missing folder ID and NULL/empty folder UID to General in export JSON only; folder-inherited access may change (requires dashboard target)")
+		flags.BoolVar(&renameCollidingLibraryPanels, "rename-colliding-library-panels", false, "rename only rehomed library panels with a name collision in General in export JSON only (requires --rehome-orphan-library-panels)")
+	}
 	if command == "import" {
+		flags.StringVar(&principalMapFile, "principal-map", "", "explicit user/team identity mapping JSON (version 1)")
 		flags.StringVar(&modeName, "mode", modeName, "import mode: require-empty, insert-only or sync")
 		flags.BoolVar(&dryRun, "dry-run", false, "show sync changes without writing")
 		flags.BoolVar(&allowDelete, "allow-delete", false, "approve sync changes, including deletion of missing rows")
@@ -57,8 +79,21 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return errors.New("require -db mysql|postgres, -file and a positive -timeout; positional arguments are not supported")
 	}
 	mode := syncdb.ImportMode(modeName)
+	targets, err := syncdb.ParseTargets(*targetNames)
+	if err != nil {
+		return err
+	}
 	if err := mode.Validate(); err != nil {
 		return err
+	}
+	if rehomeOrphanLibraryPanels && !targets.Has(syncdb.TargetDashboard) {
+		return errors.New("--rehome-orphan-library-panels requires --targets including dashboard")
+	}
+	if excludeLibraryPanelDashboards && (!targets.Has(syncdb.TargetDashboard) || rehomeOrphanLibraryPanels || renameCollidingLibraryPanels) {
+		return errors.New("--exclude-library-panel-dashboards requires dashboard target and cannot be combined with library rehome or rename options")
+	}
+	if renameCollidingLibraryPanels && !rehomeOrphanLibraryPanels {
+		return errors.New("--rename-colliding-library-panels requires --rehome-orphan-library-panels")
 	}
 	if command == "import" {
 		if mode != syncdb.ImportSync && (dryRun || allowDelete) {
@@ -73,6 +108,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return errors.New("DSN environment variable is unset or empty")
 	}
 	var snapshot *syncdb.Snapshot
+	var principalMap *syncdb.PrincipalMap
 	if command == "import" {
 		input, err := os.Open(*file)
 		if err != nil {
@@ -82,6 +118,24 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		input.Close()
 		if err != nil {
 			return err
+		}
+		snapshot, err = snapshot.Select(targets)
+		if err != nil {
+			return err
+		}
+		if snapshot.LibraryPanelsExcluded && mode == syncdb.ImportSync {
+			return errors.New("dashboard sync is not allowed for snapshots with library_panels_excluded; use require-empty or insert-only")
+		}
+		if principalMapFile != "" {
+			input, err := os.Open(principalMapFile)
+			if err != nil {
+				return errors.New("cannot open principal map")
+			}
+			principalMap, err = syncdb.DecodePrincipalMap(input)
+			input.Close()
+			if err != nil {
+				return err
+			}
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -94,11 +148,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if command == "import" {
 		var result syncdb.ImportResult
 		if mode == syncdb.ImportSync {
-			result, err = db.Sync(ctx, snapshot, syncdb.SyncOptions{DryRun: dryRun, AllowDelete: allowDelete})
+			result, err = db.Sync(ctx, snapshot, syncdb.SyncOptions{DryRun: dryRun, AllowDelete: allowDelete, PrincipalMap: principalMap})
 		} else {
-			result, err = db.ImportWithMode(ctx, snapshot, mode)
+			result, err = db.ImportWithOptions(ctx, snapshot, mode, syncdb.ImportOptions{PrincipalMap: principalMap})
 		}
 		if err != nil {
+			return err
+		}
+		if err := printSelection(stdout, snapshot); err != nil {
 			return err
 		}
 		if mode == syncdb.ImportSync {
@@ -112,7 +169,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			for _, entry := range []struct {
 				name  string
 				count syncdb.TableResult
-			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}} {
+			}{{"org", result.Org}, {"data_keys", result.DataKeys}, {"data_source", result.DataSource}, {"secrets", result.Secrets}, {"folder", result.Folder}, {"dashboard", result.Dashboard}, {"library_element", result.LibraryElement}, {"library_element_connection", result.LibraryConnection}, {"dashboard_tag", result.DashboardTag}, {"dashboard_version", result.DashboardVersion}, {"dashboard_permissions", result.DashboardPermissions}, {"rbac_roles", result.RBACRoles}, {"rbac_user_assignments", result.RBACUserAssignments}, {"rbac_team_assignments", result.RBACTeamAssignments}, {"rbac_builtin_assignments", result.RBACBuiltinAssignments}, {"dashboard_acl", result.DashboardACL}} {
+				if !tableSelected(entry.name, targets) {
+					continue
+				}
 				if _, err := fmt.Fprintf(stdout, "%s: inserted=%d updated=%d deleted=%d unchanged=%d skipped=%d\n", entry.name, entry.count.Inserted, entry.count.Updated, entry.count.Deleted, entry.count.Unchanged, entry.count.Skipped); err != nil {
 					return err
 				}
@@ -122,15 +182,66 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "import completed: mode=%s inserted=%d skipped=%d\n", mode, result.Inserted, result.Skipped)
 		return err
 	} else {
-		snapshot, err = db.Export(ctx)
+		result, err := db.ExportWithOptions(ctx, targets, syncdb.ExportOptions{RehomeOrphanLibraryPanels: rehomeOrphanLibraryPanels, RenameCollidingLibraryPanels: renameCollidingLibraryPanels, ExcludeLibraryPanelDashboards: excludeLibraryPanelDashboards})
 		if err != nil {
 			return err
+		}
+		snapshot = result.Snapshot
+		if snapshot.LibraryPanelsExcluded {
+			if _, err := fmt.Fprintf(stderr, "warning: excluded library-panel dashboards=%d history=%d tags=%d library_panels=%d connections=%d from export only; source database unchanged; dashboard sync disabled for this snapshot\n", result.ExcludedLibraryDashboards, result.ExcludedLibraryHistory, result.ExcludedLibraryTags, result.ExcludedLibraryPanels, result.ExcludedLibraryConnections); err != nil {
+				return err
+			}
+		}
+		if result.OmittedOrphanLibraryConnections > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: omitted %d orphan library connections from export JSON only because their dashboards do not exist; source database unchanged\n", result.OmittedOrphanLibraryConnections); err != nil {
+				return err
+			}
+		}
+		if result.RehomedLibraryPanels > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: rehomed %d orphan library panels to General in export JSON only; source database unchanged; folder-inherited access may change\n", result.RehomedLibraryPanels); err != nil {
+				return err
+			}
+		}
+		if result.RenamedLibraryPanels > 0 {
+			if _, err := fmt.Fprintf(stderr, "warning: renamed %d rehomed library panels in export JSON only to avoid General name collisions; source database and panel model unchanged\n", result.RenamedLibraryPanels); err != nil {
+				return err
+			}
 		}
 		if err := writeSnapshot(*file, snapshot); err != nil {
 			return err
 		}
+		if err := printSelection(stdout, snapshot); err != nil {
+			return err
+		}
 	}
-	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows))
+	_, err = fmt.Fprintf(stdout, "%s completed: org=%d data_source=%d data_keys=%d secrets=%d dashboard=%d folder=%d dashboard_tag=%d dashboard_version=%d library_element=%d library_element_connection=%d\n", command, len(snapshot.Org.Rows), len(snapshot.DataSource.Rows), len(snapshot.DataKeys.Rows), len(snapshot.Secrets.Rows), len(snapshot.Dashboard.Rows), len(snapshot.Folder.Rows), len(snapshot.DashboardTag.Rows), len(snapshot.DashboardVersion.Rows), len(snapshot.LibraryElement.Rows), len(snapshot.LibraryConnection.Rows))
+	return err
+}
+
+func tableSelected(name string, targets syncdb.Targets) bool {
+	switch name {
+	case "org":
+		return targets.Has(syncdb.TargetOrg)
+	case "data_source", "data_keys", "secrets":
+		return targets.Has(syncdb.TargetDatasource)
+	default:
+		return targets.Has(syncdb.TargetDashboard)
+	}
+}
+
+func printSelection(out io.Writer, s *syncdb.Snapshot) error {
+	_, err := fmt.Fprintf(out, "targets=%s scope.org_ids=%s\n", s.Selection(), strings.Join(s.ScopeIDs(), ","))
+	if err == nil && s.Selection().Has(syncdb.TargetDashboard) {
+		tables := "dashboard,folder,dashboard_tag,dashboard_version"
+		if s.Version >= 4 {
+			tables += ",library_element,library_element_connection"
+		}
+		permissions := "Viewer/Editor permissions"
+		if s.Version >= 5 {
+			permissions = "resource RBAC (explicit principal mapping required for user/team grants)"
+		}
+		_, err = fmt.Fprintln(out, "dashboard tables: "+tables+"; includes "+permissions+"; public sharing settings excluded (existing target sharing unchanged); warning: dynamic and plugin-specific external references cannot be fully checked")
+	}
 	return err
 }
 

@@ -70,7 +70,11 @@ func TestImportModesWithDatabase(t *testing.T) {
 				if err := Run(ctx, args, &out, &bytes.Buffer{}); err != nil {
 					t.Fatal(err)
 				}
-				if out.String() != want+"\n" {
+				orgIDs := make([]string, len(s.Org.Rows))
+				for i, row := range s.Org.Rows {
+					orgIDs[i] = *row[0]
+				}
+				if out.String() != "targets=org,datasource scope.org_ids="+strings.Join(orgIDs, ",")+"\n"+want+"\n" {
 					t.Fatalf("unexpected output: %q", out.String())
 				}
 			}

@@ -72,6 +72,98 @@ func TestImportValidatesBeforeConnecting(t *testing.T) {
 	}
 }
 
+func TestLibraryExclusionFlagValidation(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	for _, options := range [][]string{
+		{},
+		{"--targets", "dashboard", "--rehome-orphan-library-panels"},
+		{"--targets", "dashboard", "--rename-colliding-library-panels"},
+	} {
+		args := append([]string{"export", "-db", "mysql", "-file", "unused", "--exclude-library-panel-dashboards"}, options...)
+		err := Run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "--exclude-library-panel-dashboards requires") {
+			t.Fatal("invalid exclusion options reached the database", err)
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--exclude-library-panel-dashboards"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("export-only exclusion flag accepted on import")
+	}
+}
+
+func TestPrincipalMapFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := os.WriteFile(path, []byte(`{"version":5,"targets":["org"],"scope":{"org_ids":[]},"tables":{"org":{"columns":["id","name"],"rows":[]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mapping := filepath.Join(t.TempDir(), "principals.json")
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	for _, data := range []string{`{"version":2,"mappings":[]}`, `{"version":1,"mappings":[{"org_id":"1","kind":"user","source_id":1,"target_id":"2","target_uid":"uid"}]}`, `{"password":"must-not-be-logged"}`} {
+		if err := os.WriteFile(mapping, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", path, "--targets", "org", "--principal-map", mapping}, &bytes.Buffer{}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), "principal map") || strings.Contains(err.Error(), "must-not-be-logged") {
+			t.Fatal("invalid principal map was not safely rejected before connecting", err)
+		}
+	}
+}
+
+func TestRehomeOrphanLibraryPanelsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+		err := Run(context.Background(), []string{"export", "-db", "mysql", "-file", "missing.json", "--targets", targets.String(), "--rehome-orphan-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{})
+		want := "--rehome-orphan-library-panels requires --targets including dashboard"
+		if targets.Has(syncdb.TargetDashboard) {
+			want = "DSN environment variable is unset or empty"
+		}
+		if err == nil || err.Error() != want {
+			t.Fatal("unexpected flag validation", targets, err)
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--rehome-orphan-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatal("import accepted export-only repair option", err)
+	}
+	var help bytes.Buffer
+	if err := Run(context.Background(), []string{"export", "--help"}, &bytes.Buffer{}, &help); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"rehome-orphan-library-panels", "General", "access may change"} {
+		if !strings.Contains(help.String(), text) {
+			t.Fatal("help omits rehome restriction or risk", text)
+		}
+	}
+}
+
+func TestRenameCollidingLibraryPanelsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for _, rehome := range []bool{false, true} {
+		for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+			args := []string{"export", "-db", "mysql", "-file", "missing.json", "--targets", targets.String(), "--rename-colliding-library-panels"}
+			want := "--rename-colliding-library-panels requires --rehome-orphan-library-panels"
+			if rehome {
+				args = append(args, "--rehome-orphan-library-panels")
+				want = "--rehome-orphan-library-panels requires --targets including dashboard"
+				if targets.Has(syncdb.TargetDashboard) {
+					want = "DSN environment variable is unset or empty"
+				}
+			}
+			if err := Run(context.Background(), args, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || err.Error() != want {
+				t.Fatal("rename flag accepted without required options or failed before DSN check", targets, err)
+			}
+		}
+	}
+	if err := Run(context.Background(), []string{"import", "--rename-colliding-library-panels"}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatal("import accepted export-only name repair", err)
+	}
+	var help bytes.Buffer
+	if err := Run(context.Background(), []string{"export", "--help"}, &bytes.Buffer{}, &help); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(help.String(), "rename-colliding-library-panels") || !strings.Contains(help.String(), "requires --rehome-orphan-library-panels") {
+		t.Fatal("help omitted rename restrictions")
+	}
+}
+
 func TestImportModeFlag(t *testing.T) {
 	t.Setenv("GRAFANA_SYNC_DSN", "")
 	for _, mode := range []string{"require-empty", "insert-only"} {
@@ -109,5 +201,43 @@ func TestImportModeFlag(t *testing.T) {
 		if err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", "missing.json", "--mode", "sync", option}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || err.Error() != "DSN environment variable is unset or empty" {
 			t.Fatalf("rejected approved sync: %v", err)
 		}
+	}
+}
+
+func TestTargetsFlag(t *testing.T) {
+	t.Setenv("GRAFANA_SYNC_DSN", "")
+	for _, command := range []string{"export", "import"} {
+		for targets := syncdb.Targets(1); targets <= syncdb.AllTargets; targets++ {
+			err := Run(context.Background(), []string{command, "-db", "mysql", "-file", "missing.json", "--targets", targets.String()}, &bytes.Buffer{}, &bytes.Buffer{})
+			if err == nil || err.Error() != "DSN environment variable is unset or empty" {
+				t.Fatalf("valid targets rejected: %v", err)
+			}
+		}
+		for _, value := range []string{"", "org,", "data_source", "dashboard,dashboard", "unknown"} {
+			err := Run(context.Background(), []string{command, "-db", "mysql", "-file", "missing.json", "--targets", value}, &bytes.Buffer{}, &bytes.Buffer{})
+			if err == nil || strings.Contains(err.Error(), "DSN") {
+				t.Fatalf("invalid targets accepted: %v", err)
+			}
+		}
+	}
+	path := filepath.Join(t.TempDir(), "org.json")
+	s := &syncdb.Snapshot{Version: 3, Targets: []string{"org"}, Scope: syncdb.Scope{OrgIDs: []string{}}, Org: syncdb.Table{Columns: []string{"id"}, Rows: [][]*string{}}}
+	if err := writeSnapshot(path, s); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GRAFANA_SYNC_DSN", "invalid-dsn")
+	if err := Run(context.Background(), []string{"import", "-db", "mysql", "-file", path}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "absent") {
+		t.Fatalf("default inferred absent targets: %v", err)
+	}
+}
+
+func TestSelectionExplainsPublicSharingExclusion(t *testing.T) {
+	var out bytes.Buffer
+	s := &syncdb.Snapshot{Version: 3, Targets: []string{"dashboard"}}
+	if err := printSelection(&out, s); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "public sharing settings excluded (existing target sharing unchanged)") {
+		t.Fatal("selection output does not explain public sharing exclusion")
 	}
 }
